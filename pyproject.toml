@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dub-mvp"
+version = "0.1.0"
+description = "A resumable English-to-Hindi video dubbing pipeline."
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "pydantic>=2.11,<3",
+  "typer>=0.16,<1",
+]
+
+[project.scripts]
+dub-mvp = "dub_mvp.cli:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dub_mvp"]
