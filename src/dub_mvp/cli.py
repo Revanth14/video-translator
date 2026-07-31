@@ -16,6 +16,7 @@ from dub_mvp.manifest import (
 )
 from dub_mvp.localize import LocalizationError, LocalizationPipeline
 from dub_mvp.media import MediaIngestor, MediaToolError
+from dub_mvp.synthesize import SynthesisError, SynthesisPipeline
 from dub_mvp.timecode import parse_timecode_ms
 from dub_mvp.transcribe import TranscriptionError, TranscriptionPipeline
 
@@ -294,6 +295,103 @@ def localize(
 
 
 @app.command()
+def synthesize(
+    run: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Existing run directory with localized segment outputs.",
+    ),
+    voice_reference: Path = typer.Option(
+        ...,
+        "--voice-reference",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="JSON voice reference with explicit consent metadata.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Generate a new TTS revision even when outputs exist.",
+    ),
+    model: str = typer.Option(
+        "ai4bharat/IndicF5",
+        help="Speech model name to record and load.",
+    ),
+) -> None:
+    """Generate one Hindi speech audio artifact per localized segment."""
+    try:
+        manifest = RunManifest.load(run)
+    except (OSError, ValueError) as error:
+        typer.echo(f"Unable to read run manifest: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
+    stage = manifest.stages.setdefault("synthesize", StageRecord())
+    if (
+        not force
+        and stage.status == StageStatus.COMPLETED
+        and _synthesize_outputs_exist(stage.outputs)
+    ):
+        typer.echo(f"Synthesize already complete: {run}")
+        typer.echo(json.dumps(manifest.public_summary(), indent=2))
+        return
+
+    localized_output = manifest.outputs.get("localized_segments")
+    if not localized_output:
+        typer.echo("Synthesize requires localized segments.", err=True)
+        raise typer.Exit(code=1)
+
+    stage.status = StageStatus.RUNNING
+    stage.started_at = datetime.now(timezone.utc)
+    stage.completed_at = None
+    stage.error = None
+    manifest.status = RunStatus.RUNNING
+    manifest.save(run)
+
+    started = time.monotonic()
+    try:
+        synthesized_segments, outputs, model_name = SynthesisPipeline(
+            model_name=model,
+        ).run(
+            localized_segments_path=Path(localized_output),
+            run_directory=run,
+            target_language=manifest.target_language,
+            voice_reference_path=voice_reference,
+        )
+    except SynthesisError as error:
+        message = str(error)
+        stage.status = StageStatus.FAILED
+        stage.error = message
+        stage.completed_at = datetime.now(timezone.utc)
+        manifest.status = RunStatus.FAILED
+        manifest.errors.append(message)
+        manifest.timings_seconds["synthesize"] = time.monotonic() - started
+        manifest.save(run)
+        typer.echo(f"Synthesize failed: {message}", err=True)
+        typer.echo(f"Run manifest: {run / 'manifest.json'}")
+        raise typer.Exit(code=1) from error
+
+    stage.status = StageStatus.COMPLETED
+    stage.completed_at = datetime.now(timezone.utc)
+    stage.outputs = outputs
+    manifest.status = RunStatus.SYNTHESIZED
+    manifest.models["tts"] = model_name
+    manifest.outputs.update(outputs)
+    manifest.timings_seconds["synthesize"] = time.monotonic() - started
+    manifest.save(run)
+
+    typer.echo(f"Synthesize complete: {run}")
+    typer.echo(f"Segments: {len(synthesized_segments)}")
+    typer.echo(json.dumps(manifest.public_summary(), indent=2))
+
+
+@app.command()
 def show(
     run: Path = typer.Argument(
         ...,
@@ -328,6 +426,13 @@ def _transcribe_outputs_exist(outputs: dict[str, str]) -> bool:
 
 def _localize_outputs_exist(outputs: dict[str, str]) -> bool:
     required = {"localization_raw", "localized_segments"}
+    return required.issubset(outputs) and all(
+        Path(outputs[name]).is_file() for name in required
+    )
+
+
+def _synthesize_outputs_exist(outputs: dict[str, str]) -> bool:
+    required = {"synthesis_raw", "synthesized_segments"}
     return required.issubset(outputs) and all(
         Path(outputs[name]).is_file() for name in required
     )

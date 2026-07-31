@@ -1,0 +1,28 @@
+[
+  {
+    "segment_id": "seg_0001",
+    "start_ms": 120,
+    "end_ms": 3400,
+    "duration_budget_ms": 3280,
+    "speaker_id": null,
+    "source_text": "Welcome to the API deployment demo.",
+    "target_text": "API deployment demo mein swagat hai.",
+    "target_text_revision": 1,
+    "localization_status": "localized",
+    "localization_notes": [],
+    "glossary_terms": ["API"]
+  },
+  {
+    "segment_id": "seg_0002",
+    "start_ms": 4200,
+    "end_ms": 8600,
+    "duration_budget_ms": 4400,
+    "speaker_id": null,
+    "source_text": "First, we build the Docker image.",
+    "target_text": "Pehle, hum Docker image build karte hain.",
+    "target_text_revision": 1,
+    "localization_status": "localized",
+    "localization_notes": [],
+    "glossary_terms": ["Docker"]
+  }
+]
