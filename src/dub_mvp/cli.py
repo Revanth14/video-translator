@@ -11,10 +11,12 @@ import typer
 from dub_mvp.manifest import (
     RunManifest,
     RunStatus,
+    StageRecord,
     StageStatus,
 )
 from dub_mvp.media import MediaIngestor, MediaToolError
 from dub_mvp.timecode import parse_timecode_ms
+from dub_mvp.transcribe import TranscriptionError, TranscriptionPipeline
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -105,6 +107,94 @@ def ingest(
 
 
 @app.command()
+def transcribe(
+    run: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Existing run directory created by ingest.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Re-run transcription even when completed outputs exist.",
+    ),
+    model: str = typer.Option(
+        "large-v3",
+        help="WhisperX model name to record and load.",
+    ),
+) -> None:
+    """Transcribe the ingested working audio into normalized segment JSON."""
+    try:
+        manifest = RunManifest.load(run)
+    except (OSError, ValueError) as error:
+        typer.echo(f"Unable to read run manifest: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
+    stage = manifest.stages.setdefault("transcribe", StageRecord())
+    if (
+        not force
+        and stage.status == StageStatus.COMPLETED
+        and _transcribe_outputs_exist(stage.outputs)
+    ):
+        typer.echo(f"Transcribe already complete: {run}")
+        typer.echo(json.dumps(manifest.public_summary(), indent=2))
+        return
+
+    audio_output = manifest.outputs.get("working_audio")
+    if not audio_output:
+        typer.echo("Transcribe requires a completed ingest stage.", err=True)
+        raise typer.Exit(code=1)
+
+    audio_path = Path(audio_output)
+    stage.status = StageStatus.RUNNING
+    stage.started_at = datetime.now(timezone.utc)
+    stage.completed_at = None
+    stage.error = None
+    manifest.status = RunStatus.RUNNING
+    manifest.save(run)
+
+    started = time.monotonic()
+    try:
+        transcript, segments, outputs = TranscriptionPipeline(
+            model_name=model,
+        ).run(
+            audio_path=audio_path,
+            run_directory=run,
+            language=manifest.source_language,
+            duration_ms=manifest.duration_ms,
+        )
+    except TranscriptionError as error:
+        message = str(error)
+        stage.status = StageStatus.FAILED
+        stage.error = message
+        stage.completed_at = datetime.now(timezone.utc)
+        manifest.status = RunStatus.FAILED
+        manifest.errors.append(message)
+        manifest.timings_seconds["transcribe"] = time.monotonic() - started
+        manifest.save(run)
+        typer.echo(f"Transcribe failed: {message}", err=True)
+        typer.echo(f"Run manifest: {run / 'manifest.json'}")
+        raise typer.Exit(code=1) from error
+
+    stage.status = StageStatus.COMPLETED
+    stage.completed_at = datetime.now(timezone.utc)
+    stage.outputs = outputs
+    manifest.status = RunStatus.TRANSCRIBED
+    manifest.models["whisperx"] = transcript.model
+    manifest.outputs.update(outputs)
+    manifest.timings_seconds["transcribe"] = time.monotonic() - started
+    manifest.save(run)
+
+    typer.echo(f"Transcribe complete: {run}")
+    typer.echo(f"Segments: {len(segments)}")
+    typer.echo(json.dumps(manifest.public_summary(), indent=2))
+
+
+@app.command()
 def show(
     run: Path = typer.Argument(
         ...,
@@ -128,3 +218,10 @@ def _new_run_id(name: str) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return f"{timestamp}-{slug or 'run'}"
+
+
+def _transcribe_outputs_exist(outputs: dict[str, str]) -> bool:
+    required = {"whisperx_raw", "transcript", "segments"}
+    return required.issubset(outputs) and all(
+        Path(outputs[name]).is_file() for name in required
+    )

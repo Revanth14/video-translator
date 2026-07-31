@@ -14,6 +14,7 @@ class RunStatus(str, Enum):
     CREATED = "created"
     RUNNING = "running"
     INGESTED = "ingested"
+    TRANSCRIBED = "transcribed"
     FAILED = "failed"
 
 
@@ -62,7 +63,10 @@ class RunManifest(BaseModel):
     media: MediaMetadata | None = None
     models: dict[str, str] = Field(default_factory=dict)
     stages: dict[str, StageRecord] = Field(
-        default_factory=lambda: {"ingest": StageRecord()}
+        default_factory=lambda: {
+            "ingest": StageRecord(),
+            "transcribe": StageRecord(),
+        }
     )
     outputs: dict[str, str] = Field(default_factory=dict)
     timings_seconds: dict[str, float] = Field(default_factory=dict)
