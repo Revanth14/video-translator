@@ -33,4 +33,5 @@ def test_manifest_summary_omits_internal_media_detail() -> None:
     assert manifest.public_summary()["stages"] == {
         "ingest": "pending",
         "transcribe": "pending",
+        "localize": "pending",
     }

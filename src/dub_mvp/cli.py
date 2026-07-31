@@ -14,6 +14,7 @@ from dub_mvp.manifest import (
     StageRecord,
     StageStatus,
 )
+from dub_mvp.localize import LocalizationError, LocalizationPipeline
 from dub_mvp.media import MediaIngestor, MediaToolError
 from dub_mvp.timecode import parse_timecode_ms
 from dub_mvp.transcribe import TranscriptionError, TranscriptionPipeline
@@ -195,6 +196,104 @@ def transcribe(
 
 
 @app.command()
+def localize(
+    run: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Existing run directory with transcription outputs.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Re-run localization even when completed outputs exist.",
+    ),
+    glossary: Path | None = typer.Option(
+        None,
+        "--glossary",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Optional JSON glossary for technical terms.",
+    ),
+    model: str = typer.Option(
+        "gpt-5-mini",
+        help="Translator model name to record and load.",
+    ),
+) -> None:
+    """Localize source transcript segments into spoken Hindi text."""
+    try:
+        manifest = RunManifest.load(run)
+    except (OSError, ValueError) as error:
+        typer.echo(f"Unable to read run manifest: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
+    stage = manifest.stages.setdefault("localize", StageRecord())
+    if (
+        not force
+        and stage.status == StageStatus.COMPLETED
+        and _localize_outputs_exist(stage.outputs)
+    ):
+        typer.echo(f"Localize already complete: {run}")
+        typer.echo(json.dumps(manifest.public_summary(), indent=2))
+        return
+
+    segments_output = manifest.outputs.get("segments")
+    if not segments_output:
+        typer.echo("Localize requires completed transcription segments.", err=True)
+        raise typer.Exit(code=1)
+
+    stage.status = StageStatus.RUNNING
+    stage.started_at = datetime.now(timezone.utc)
+    stage.completed_at = None
+    stage.error = None
+    manifest.status = RunStatus.RUNNING
+    manifest.save(run)
+
+    started = time.monotonic()
+    try:
+        localized_segments, outputs, model_name = LocalizationPipeline(
+            model_name=model,
+        ).run(
+            segments_path=Path(segments_output),
+            run_directory=run,
+            source_language=manifest.source_language,
+            target_language=manifest.target_language,
+            glossary_path=glossary,
+        )
+    except LocalizationError as error:
+        message = str(error)
+        stage.status = StageStatus.FAILED
+        stage.error = message
+        stage.completed_at = datetime.now(timezone.utc)
+        manifest.status = RunStatus.FAILED
+        manifest.errors.append(message)
+        manifest.timings_seconds["localize"] = time.monotonic() - started
+        manifest.save(run)
+        typer.echo(f"Localize failed: {message}", err=True)
+        typer.echo(f"Run manifest: {run / 'manifest.json'}")
+        raise typer.Exit(code=1) from error
+
+    stage.status = StageStatus.COMPLETED
+    stage.completed_at = datetime.now(timezone.utc)
+    stage.outputs = outputs
+    manifest.status = RunStatus.LOCALIZED
+    manifest.models["translator"] = model_name
+    manifest.outputs.update(outputs)
+    manifest.timings_seconds["localize"] = time.monotonic() - started
+    manifest.save(run)
+
+    typer.echo(f"Localize complete: {run}")
+    typer.echo(f"Segments: {len(localized_segments)}")
+    typer.echo(json.dumps(manifest.public_summary(), indent=2))
+
+
+@app.command()
 def show(
     run: Path = typer.Argument(
         ...,
@@ -222,6 +321,13 @@ def _new_run_id(name: str) -> str:
 
 def _transcribe_outputs_exist(outputs: dict[str, str]) -> bool:
     required = {"whisperx_raw", "transcript", "segments"}
+    return required.issubset(outputs) and all(
+        Path(outputs[name]).is_file() for name in required
+    )
+
+
+def _localize_outputs_exist(outputs: dict[str, str]) -> bool:
+    required = {"localization_raw", "localized_segments"}
     return required.issubset(outputs) and all(
         Path(outputs[name]).is_file() for name in required
     )

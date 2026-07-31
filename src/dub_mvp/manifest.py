@@ -15,6 +15,7 @@ class RunStatus(str, Enum):
     RUNNING = "running"
     INGESTED = "ingested"
     TRANSCRIBED = "transcribed"
+    LOCALIZED = "localized"
     FAILED = "failed"
 
 
@@ -66,6 +67,7 @@ class RunManifest(BaseModel):
         default_factory=lambda: {
             "ingest": StageRecord(),
             "transcribe": StageRecord(),
+            "localize": StageRecord(),
         }
     )
     outputs: dict[str, str] = Field(default_factory=dict)

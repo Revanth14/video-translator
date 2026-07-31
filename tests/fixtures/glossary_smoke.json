@@ -1,0 +1,14 @@
+{
+  "terms": [
+    {
+      "source": "Docker",
+      "target": "Docker",
+      "note": "Keep in English."
+    },
+    {
+      "source": "API",
+      "target": "API",
+      "note": "Keep in English for developer audiences."
+    }
+  ]
+}

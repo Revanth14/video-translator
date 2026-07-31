@@ -1,0 +1,20 @@
+[
+  {
+    "segment_id": "seg_0001",
+    "start_ms": 120,
+    "end_ms": 3400,
+    "duration_budget_ms": 3280,
+    "speaker_id": null,
+    "source_text": "Welcome to the API deployment demo.",
+    "word_indexes": [0, 1, 2, 3, 4, 5]
+  },
+  {
+    "segment_id": "seg_0002",
+    "start_ms": 4200,
+    "end_ms": 8600,
+    "duration_budget_ms": 4400,
+    "speaker_id": null,
+    "source_text": "First, we build the Docker image.",
+    "word_indexes": [6, 7, 8, 9, 10, 11]
+  }
+]
