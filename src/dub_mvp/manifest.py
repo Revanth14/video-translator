@@ -12,16 +12,19 @@ from pydantic import BaseModel, Field
 
 class RunStatus(str, Enum):
     CREATED = "created"
+    QUEUED = "queued"
     RUNNING = "running"
     INGESTED = "ingested"
     TRANSCRIBED = "transcribed"
     LOCALIZED = "localized"
     SYNTHESIZED = "synthesized"
+    RENDERED = "rendered"
     FAILED = "failed"
 
 
 class StageStatus(str, Enum):
     PENDING = "pending"
+    QUEUED = "queued"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -70,6 +73,7 @@ class RunManifest(BaseModel):
             "transcribe": StageRecord(),
             "localize": StageRecord(),
             "synthesize": StageRecord(),
+            "render": StageRecord(),
         }
     )
     outputs: dict[str, str] = Field(default_factory=dict)

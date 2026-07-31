@@ -35,4 +35,5 @@ def test_manifest_summary_omits_internal_media_detail() -> None:
         "transcribe": "pending",
         "localize": "pending",
         "synthesize": "pending",
+        "render": "pending",
     }

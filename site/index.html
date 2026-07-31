@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Video Translator</title>
+  <meta name="description" content="Translate and dub videos with Video Translator.">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div class="brand">
+        <span>Video Translator</span>
+      </div>
+      <button id="resetButton" type="button">Reset</button>
+    </header>
+
+    <section class="grid">
+      <div class="panel source-panel">
+        <div class="panel-head">
+          <h1>Translate video</h1>
+          <span id="uploadStatus">No file</span>
+        </div>
+
+        <label class="dropzone" id="dropzone">
+          <input id="videoInput" type="file" accept="video/*">
+          <canvas id="posterCanvas" width="960" height="540" aria-hidden="true"></canvas>
+          <span>
+            <strong>Upload video</strong>
+            <small>Drop a file or click to browse</small>
+          </span>
+        </label>
+
+        <video id="sourceVideo" controls playsinline></video>
+
+        <div class="controls">
+          <label>
+            Language
+            <select id="languageSelect">
+              <option value="hi">Hindi</option>
+              <option value="es">Spanish</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+              <option value="ja">Japanese</option>
+            </select>
+          </label>
+        </div>
+
+        <details class="advanced">
+          <summary>Advanced</summary>
+          <div class="controls">
+            <label>
+              Glossary
+              <input id="glossaryInput" type="file" accept="application/json,.json">
+            </label>
+
+            <label>
+              Voice reference
+              <input id="voiceReferenceInput" type="file" accept="application/json,.json">
+            </label>
+          </div>
+        </details>
+
+        <button class="primary" id="startButton" type="button" disabled>
+          Start translation
+        </button>
+        <button class="secondary" id="retryButton" type="button" hidden>
+          Retry
+        </button>
+      </div>
+
+      <div class="panel result">
+        <div class="panel-head">
+          <h2>Result</h2>
+          <span id="runStatus">Ready</span>
+        </div>
+
+        <div class="preview" id="resultPreview">
+          <span>Result appears here</span>
+        </div>
+
+        <div class="progress">
+          <div id="progressBar"></div>
+        </div>
+
+        <div class="steps" id="stageGrid">
+          <span data-stage="upload">Upload</span>
+          <span data-stage="transcribe">Transcribe</span>
+          <span data-stage="translate">Translate</span>
+          <span data-stage="voice">Voice</span>
+          <span data-stage="render">Render</span>
+        </div>
+
+        <div class="downloads">
+          <a class="download-link disabled" id="videoDownload">Video</a>
+          <a class="download-link disabled" id="subtitleDownload">Subtitles</a>
+          <a class="download-link disabled" id="audioDownload">Audio</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>

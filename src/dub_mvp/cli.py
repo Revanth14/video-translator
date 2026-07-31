@@ -16,9 +16,13 @@ from dub_mvp.manifest import (
 )
 from dub_mvp.localize import LocalizationError, LocalizationPipeline
 from dub_mvp.media import MediaIngestor, MediaToolError
+from dub_mvp.preflight import build_preflight_report, report_to_json
+from dub_mvp.render import RenderError, RenderPipeline
 from dub_mvp.synthesize import SynthesisError, SynthesisPipeline
 from dub_mvp.timecode import parse_timecode_ms
 from dub_mvp.transcribe import TranscriptionError, TranscriptionPipeline
+from dub_mvp.ui import UiServer
+from dub_mvp.webapp import ProductWebServer
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -392,6 +396,214 @@ def synthesize(
 
 
 @app.command()
+def render(
+    run: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Existing run directory with synthesized segment outputs.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Re-render final media even when completed outputs exist.",
+    ),
+) -> None:
+    """Assemble synthesized speech into subtitle, audio, and video outputs."""
+    try:
+        manifest = RunManifest.load(run)
+    except (OSError, ValueError) as error:
+        typer.echo(f"Unable to read run manifest: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
+    stage = manifest.stages.setdefault("render", StageRecord())
+    if (
+        not force
+        and stage.status == StageStatus.COMPLETED
+        and _render_outputs_exist(stage.outputs)
+    ):
+        typer.echo(f"Render already complete: {run}")
+        typer.echo(json.dumps(manifest.public_summary(), indent=2))
+        return
+
+    synthesized_output = manifest.outputs.get("synthesized_segments")
+    source_segment = manifest.outputs.get("source_segment")
+    if not synthesized_output:
+        typer.echo("Render requires synthesized segments.", err=True)
+        raise typer.Exit(code=1)
+    if not source_segment:
+        typer.echo("Render requires the ingested source segment.", err=True)
+        raise typer.Exit(code=1)
+
+    stage.status = StageStatus.RUNNING
+    stage.started_at = datetime.now(timezone.utc)
+    stage.completed_at = None
+    stage.error = None
+    manifest.status = RunStatus.RUNNING
+    manifest.save(run)
+
+    started = time.monotonic()
+    try:
+        plan, outputs = RenderPipeline().run(
+            synthesized_segments_path=Path(synthesized_output),
+            source_segment_path=Path(source_segment),
+            run_directory=run,
+            duration_ms=manifest.duration_ms,
+        )
+    except RenderError as error:
+        message = str(error)
+        stage.status = StageStatus.FAILED
+        stage.error = message
+        stage.completed_at = datetime.now(timezone.utc)
+        manifest.status = RunStatus.FAILED
+        manifest.errors.append(message)
+        manifest.timings_seconds["render"] = time.monotonic() - started
+        manifest.save(run)
+        typer.echo(f"Render failed: {message}", err=True)
+        typer.echo(f"Run manifest: {run / 'manifest.json'}")
+        raise typer.Exit(code=1) from error
+
+    stage.status = StageStatus.COMPLETED
+    stage.completed_at = datetime.now(timezone.utc)
+    stage.outputs = outputs
+    manifest.status = RunStatus.RENDERED
+    manifest.outputs.update(outputs)
+    manifest.timings_seconds["render"] = time.monotonic() - started
+    manifest.save(run)
+
+    review_count = sum(1 for segment in plan.segments if segment.needs_review)
+    typer.echo(f"Render complete: {run}")
+    typer.echo(f"Segments: {len(plan.segments)}")
+    typer.echo(f"Needs review: {review_count}")
+    typer.echo(json.dumps(manifest.public_summary(), indent=2))
+
+
+@app.command()
+def preflight(
+    run: Path | None = typer.Option(
+        None,
+        "--run",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Optional run directory to inspect for stage artifacts.",
+    ),
+    voice_reference: Path | None = typer.Option(
+        None,
+        "--voice-reference",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Optional voice reference JSON to validate.",
+    ),
+) -> None:
+    """Check local readiness before provisioning or using GPU runtime."""
+    report = build_preflight_report(
+        run_directory=run,
+        voice_reference_path=voice_reference,
+    )
+    typer.echo(report_to_json(report).rstrip())
+    if not report.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def ui(
+    runs: Path = typer.Option(
+        Path("runs"),
+        "--runs",
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Directory containing saved dubbing runs.",
+    ),
+    host: str = typer.Option(
+        "127.0.0.1",
+        help="Host interface for the review UI.",
+    ),
+    port: int = typer.Option(
+        8765,
+        help="Port for the review UI.",
+    ),
+    open_browser: bool = typer.Option(
+        True,
+        "--open/--no-open",
+        help="Open the UI in the default browser.",
+    ),
+) -> None:
+    """Start the customer-facing dubbing review UI."""
+    server = UiServer(runs_directory=runs, host=host, port=port)
+    typer.echo(f"Dub MVP Studio: {server.url}")
+    try:
+        server.serve_forever(open_browser=open_browser)
+    except KeyboardInterrupt:
+        typer.echo("Stopped Dub MVP Studio.")
+
+
+@app.command()
+def web(
+    runs: Path = typer.Option(
+        Path("runs"),
+        "--runs",
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Directory for customer-created translation jobs.",
+    ),
+    site: Path = typer.Option(
+        Path("site"),
+        "--site",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Static customer website directory.",
+    ),
+    host: str = typer.Option(
+        "127.0.0.1",
+        help="Host interface for the customer web app.",
+    ),
+    port: int = typer.Option(
+        8787,
+        help="Port for the customer web app.",
+    ),
+    open_browser: bool = typer.Option(
+        True,
+        "--open/--no-open",
+        help="Open the web app in the default browser.",
+    ),
+    runner: str | None = typer.Option(
+        None,
+        "--runner",
+        help="Job runner mode: local, queued, or remote. Defaults to VIDEO_TRANSLATOR_RUNNER or local.",
+    ),
+) -> None:
+    """Start the no-signup customer video translation web app."""
+    server = ProductWebServer(
+        runs_directory=runs,
+        site_directory=site,
+        host=host,
+        port=port,
+        runner_mode=runner,
+    )
+    typer.echo(f"Video Translator: {server.url}")
+    try:
+        server.serve_forever(open_browser=open_browser)
+    except KeyboardInterrupt:
+        typer.echo("Stopped Video Translator.")
+
+
+@app.command()
 def show(
     run: Path = typer.Argument(
         ...,
@@ -433,6 +645,18 @@ def _localize_outputs_exist(outputs: dict[str, str]) -> bool:
 
 def _synthesize_outputs_exist(outputs: dict[str, str]) -> bool:
     required = {"synthesis_raw", "synthesized_segments"}
+    return required.issubset(outputs) and all(
+        Path(outputs[name]).is_file() for name in required
+    )
+
+
+def _render_outputs_exist(outputs: dict[str, str]) -> bool:
+    required = {
+        "alignment_plan",
+        "hindi_srt",
+        "dubbed_audio",
+        "dubbed_video",
+    }
     return required.issubset(outputs) and all(
         Path(outputs[name]).is_file() for name in required
     )
