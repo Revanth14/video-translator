@@ -23,6 +23,7 @@ from dub_mvp.timecode import parse_timecode_ms
 from dub_mvp.transcribe import TranscriptionError, TranscriptionPipeline
 from dub_mvp.ui import UiServer
 from dub_mvp.webapp import ProductWebServer
+from dub_mvp.worker import WorkerError, run_worker_loop, run_worker_once
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -601,6 +602,52 @@ def web(
         server.serve_forever(open_browser=open_browser)
     except KeyboardInterrupt:
         typer.echo("Stopped Video Translator.")
+
+
+@app.command()
+def worker(
+    runs: Path = typer.Option(
+        Path("runs"),
+        "--runs",
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Directory containing queued translation runs.",
+    ),
+    once: bool = typer.Option(
+        False,
+        "--once",
+        help="Process at most one queued stage and exit.",
+    ),
+    poll_seconds: float = typer.Option(
+        5.0,
+        "--poll-seconds",
+        min=0.1,
+        help="Seconds between queue scans in daemon mode.",
+    ),
+) -> None:
+    """Process queued stages for the GPU worker runtime."""
+    try:
+        if once:
+            result = run_worker_once(runs_directory=runs)
+            if not result.processed:
+                typer.echo("No queued jobs.")
+                return
+            typer.echo(
+                f"Processed {result.run_id} {result.stage}: {result.status}"
+            )
+            return
+        typer.echo(f"Worker polling {runs} every {poll_seconds}s")
+        run_worker_loop(
+            runs_directory=runs,
+            poll_seconds=poll_seconds,
+        )
+    except WorkerError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    except KeyboardInterrupt:
+        typer.echo("Stopped worker.")
 
 
 @app.command()
