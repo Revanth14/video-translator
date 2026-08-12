@@ -50,13 +50,30 @@ def test_customer_site_interaction_uses_video_upload_and_progress() -> None:
 
     assert "URL.createObjectURL(file)" in script
     assert 'postForm("/api/jobs", form)' in script
-    assert "autoAdvance" in script
-    assert "/stages/${stage}" in script
+    assert "autoAdvance" not in script
+    assert "/stages/${stage}" not in script
+    assert "localStorage" in script
+    assert "let polling = false" in script
+    assert 'searchParams.set("job"' in script
+    assert 'form.append("glossary"' in script
+    assert 'form.append("voice_reference"' in script
     assert "customerStatus" in script
     assert "setDownload" in script
     assert "startRun" in script
     assert "finishRun" in script
     assert "progressBar" in script
+
+
+def test_customer_site_releases_a_job_that_no_longer_exists() -> None:
+    script = (SITE / "app.js").read_text(encoding="utf-8")
+
+    # A remembered run may belong to a cleaned runs directory or another
+    # machine. The page must release it instead of polling forever.
+    assert "discardMissingJob" in script
+    assert "handlePollFailure" in script
+    assert "error.status = response.status" in script
+    assert "stopPolling();" in script
+    assert "forgetJob();" in script
 
 
 def test_customer_site_uses_simple_customer_statuses() -> None:

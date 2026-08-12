@@ -28,8 +28,8 @@ class FakeIngestor:
         assert end_ms == 90000
         working = run_directory / "working"
         metadata = run_directory / "metadata"
-        working.mkdir(parents=True)
-        metadata.mkdir(parents=True)
+        working.mkdir(parents=True, exist_ok=True)
+        metadata.mkdir(parents=True, exist_ok=True)
         source_segment = working / "source_segment.mp4"
         working_audio = working / "source_audio.wav"
         probe = metadata / "ffprobe.json"
@@ -149,9 +149,10 @@ def test_web_job_service_creates_run_and_ingests(tmp_path: Path) -> None:
     run_directory = tmp_path / run_id
     manifest = RunManifest.load(run_directory)
 
-    assert manifest.status == RunStatus.INGESTED
+    assert manifest.status == RunStatus.QUEUED
     assert manifest.target_language == "hi"
     assert manifest.stages["ingest"].status == StageStatus.COMPLETED
+    assert manifest.stages["transcribe"].status == StageStatus.QUEUED
     assert Path(manifest.outputs["working_audio"]).is_file()
 
 
@@ -172,14 +173,7 @@ def test_web_job_service_runs_full_customer_lifecycle(tmp_path: Path) -> None:
     )
     run_id = payload["summary"]["run_id"]
     run_directory = tmp_path / run_id
-
-    service.run_stage(run_id=run_id, stage="transcribe")
-    assert RunManifest.load(run_directory).status == RunStatus.TRANSCRIBED
-    service.run_stage(run_id=run_id, stage="localize")
-    assert RunManifest.load(run_directory).status == RunStatus.LOCALIZED
-    service.run_stage(run_id=run_id, stage="synthesize")
-    assert RunManifest.load(run_directory).status == RunStatus.SYNTHESIZED
-    final_payload = service.run_stage(run_id=run_id, stage="render")
+    final_payload = payload
     manifest = RunManifest.load(run_directory)
 
     assert manifest.status == RunStatus.RENDERED
@@ -187,6 +181,27 @@ def test_web_job_service_runs_full_customer_lifecycle(tmp_path: Path) -> None:
     assert Path(manifest.outputs["dubbed_video"]).is_file()
     assert final_payload["summary"]["status"] == "rendered"
     assert final_payload["summary"]["outputs"]["dubbed_video"]
+
+
+def test_web_job_service_persists_inputs_at_creation(tmp_path: Path) -> None:
+    service = WebJobService(
+        runs_directory=tmp_path,
+        runner=QueuedJobRunner(),
+    )
+
+    payload = service.create_job(
+        filename="demo.mp4",
+        content=b"video",
+        target_language="hi",
+        glossary_content=b'{"terms":[]}',
+        voice_reference_content=b'{"reference_id":"voice-a","path":null}',
+    )
+    input_directory = tmp_path / payload["summary"]["run_id"] / "input"
+
+    assert (input_directory / "glossary.json").read_bytes() == b'{"terms":[]}'
+    assert b'"voice-a"' in (
+        input_directory / "voice-reference.json"
+    ).read_bytes()
 
 
 def test_web_job_service_can_queue_without_local_execution(tmp_path: Path) -> None:
@@ -210,7 +225,7 @@ def test_web_job_service_can_queue_without_local_execution(tmp_path: Path) -> No
     assert (run_directory / "metadata" / "job-queue.jsonl").is_file()
 
 
-def test_web_job_service_queues_heavy_stage_for_remote_worker(
+def test_web_job_service_does_not_duplicate_already_queued_stage(
     tmp_path: Path,
 ) -> None:
     service = WebJobService(
@@ -232,9 +247,10 @@ def test_web_job_service_queues_heavy_stage_for_remote_worker(
 
     assert queued["summary"]["status"] == "queued"
     assert manifest.stages["transcribe"].status == StageStatus.QUEUED
-    assert "transcribe" in (
+    events = (
         run_directory / "metadata" / "job-queue.jsonl"
     ).read_text(encoding="utf-8")
+    assert events.count('"stage": "transcribe"') == 0
 
 
 def test_build_runner_supports_remote_alias() -> None:

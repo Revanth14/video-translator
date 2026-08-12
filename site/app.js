@@ -6,8 +6,10 @@ const state = {
   jobId: null,
   poller: null,
   stageStatuses: {},
-  advancingStage: null,
 };
+
+const jobStorageKey = "video-translator-job-id";
+let polling = false;
 
 const stages = ["upload", "transcribe", "translate", "voice", "render"];
 
@@ -32,6 +34,7 @@ const els = {
 };
 
 drawPoster();
+restoreJob();
 
 els.videoInput.addEventListener("change", (event) => {
   const [file] = event.target.files;
@@ -112,10 +115,15 @@ async function startBackendRun() {
   form.append("language", language);
   form.append("start", "0");
   form.append("end", "90");
+  const glossary = els.glossaryInput.files[0];
+  const voiceReference = els.voiceReferenceInput.files[0];
+  if (glossary) form.append("glossary", glossary);
+  if (voiceReference) form.append("voice_reference", voiceReference);
   setRunning();
   try {
     const payload = await postForm("/api/jobs", form);
     state.jobId = payload.summary.run_id;
+    rememberJob(state.jobId);
     renderJob(payload);
     startPolling();
   } catch (error) {
@@ -125,12 +133,45 @@ async function startBackendRun() {
 }
 
 async function pollJob() {
-  if (!state.jobId) return;
+  if (!state.jobId || polling) return;
+  polling = true;
   try {
     renderJob(await getJson(`/api/jobs/${encodeURIComponent(state.jobId)}`));
   } catch (error) {
-    els.uploadStatus.textContent = error.message;
+    handlePollFailure(error);
+  } finally {
+    polling = false;
   }
+}
+
+function handlePollFailure(error) {
+  // A missing job is permanent: the run was removed, or this browser
+  // remembered a run that belongs to another machine. Release it so the page
+  // is usable again instead of polling a job that will never appear.
+  if (error.status === 400 || error.status === 404) {
+    discardMissingJob();
+    return;
+  }
+  // Anything else is treated as transient, so polling continues.
+  els.uploadStatus.textContent = error.message;
+}
+
+function discardMissingJob() {
+  stopPolling();
+  forgetJob();
+  state.jobId = null;
+  state.stageStatuses = {};
+  els.runStatus.textContent = "Ready";
+  delete els.runStatus.dataset.state;
+  els.uploadStatus.textContent = state.file
+    ? state.file.name
+    : "That job is no longer available";
+  els.startButton.disabled = !state.file;
+  els.retryButton.hidden = true;
+  els.resultPreview.innerHTML = "<span>Result appears here</span>";
+  disableDownloads();
+  setProgress(state.file ? 12 : 0);
+  completeStages(state.file ? 1 : 0);
 }
 
 function renderJob(payload) {
@@ -148,18 +189,21 @@ function renderJob(payload) {
   setProgress(Math.max(12, completed * 20));
   els.runStatus.textContent = customerStatus(summary);
   els.runStatus.dataset.state = summary.status === "failed" ? "failed" : "running";
-  els.uploadStatus.textContent = payload.errors?.[0] || summary.run_id;
+  els.uploadStatus.textContent = summary.run_id;
   const outputs = summary.outputs || {};
   const videoPath = outputs.dubbed_video;
   if (videoPath) {
-    els.resultPreview.innerHTML = `<video controls playsinline src="${mediaUrl(videoPath, summary.run_id)}"></video>`;
+    const videoUrl = mediaUrl(videoPath, summary.run_id);
+    els.resultPreview.innerHTML = (
+      `<video controls playsinline src="${videoUrl}"></video>`
+    );
     setDownload(els.videoDownload, videoPath, summary.run_id);
     setDownload(els.subtitleDownload, outputs.hindi_srt, summary.run_id);
     setDownload(els.audioDownload, outputs.dubbed_audio, summary.run_id);
   }
-  if (summary.status === "failed") {
+  if (summary.status === "failed" || summary.status === "cancelled") {
     stopPolling();
-    showFailure(payload.errors?.[0] || "Translation failed.");
+    showFailure(payload.errors?.at(-1) || "Translation failed.");
     return;
   }
   if (summary.status === "rendered") {
@@ -171,44 +215,6 @@ function renderJob(payload) {
     els.uploadStatus.textContent = "Done";
     return;
   }
-  autoAdvance(stageStatuses, summary.status);
-}
-
-async function autoAdvance(stages, status) {
-  if (!state.jobId) return;
-  const stage = nextStageFor(stages, status);
-  if (!stage) return;
-  if (state.advancingStage === stage) return;
-  state.advancingStage = stage;
-  const form = new FormData();
-  const glossary = els.glossaryInput.files[0];
-  const voiceReference = els.voiceReferenceInput.files[0];
-  if (stage === "localize" && glossary) form.append("glossary", glossary);
-  if (stage === "synthesize" && voiceReference) {
-    form.append("voice_reference", voiceReference);
-  }
-  setRunning();
-  try {
-    const payload = await postForm(
-      `/api/jobs/${encodeURIComponent(state.jobId)}/stages/${stage}`,
-      form,
-    );
-    renderJob(payload);
-  } catch (error) {
-    showFailure(error.message);
-  } finally {
-    state.advancingStage = null;
-  }
-}
-
-function nextStageFor(stages, status) {
-  if (status === "running" || status === "queued" || status === "failed") return null;
-  if (stages.ingest !== "completed") return null;
-  if (stages.transcribe !== "completed") return "transcribe";
-  if (stages.localize !== "completed") return "localize";
-  if (stages.synthesize !== "completed") return "synthesize";
-  if (stages.render !== "completed") return "render";
-  return null;
 }
 
 function setRunning() {
@@ -240,7 +246,7 @@ function retryRun() {
   stopPolling();
   state.jobId = null;
   state.stageStatuses = {};
-  state.advancingStage = null;
+  forgetJob();
   completeStages(1);
   setProgress(12);
   disableDownloads();
@@ -256,7 +262,7 @@ function reset() {
   state.timer = null;
   state.jobId = null;
   state.stageStatuses = {};
-  state.advancingStage = null;
+  forgetJob();
   els.videoInput.value = "";
   els.sourceVideo.removeAttribute("src");
   els.sourceVideo.load();
@@ -281,6 +287,48 @@ function stopPolling() {
 function startPolling() {
   stopPolling();
   state.poller = window.setInterval(pollJob, 1000);
+}
+
+function rememberJob(runId) {
+  if (!canUseBackend()) return;
+  try {
+    window.localStorage.setItem(jobStorageKey, runId);
+  } catch (_error) {
+    // URL persistence remains available when storage is blocked.
+  }
+  const url = new URL(window.location.href);
+  url.searchParams.set("job", runId);
+  window.history.replaceState({}, "", url);
+}
+
+function forgetJob() {
+  if (!canUseBackend()) return;
+  try {
+    window.localStorage.removeItem(jobStorageKey);
+  } catch (_error) {
+    // Continue clearing the URL even when storage is blocked.
+  }
+  const url = new URL(window.location.href);
+  url.searchParams.delete("job");
+  window.history.replaceState({}, "", url);
+}
+
+function restoreJob() {
+  if (!canUseBackend()) return;
+  const url = new URL(window.location.href);
+  let storedRunId = null;
+  try {
+    storedRunId = window.localStorage.getItem(jobStorageKey);
+  } catch (_error) {
+    storedRunId = null;
+  }
+  const runId = url.searchParams.get("job") || storedRunId;
+  if (!runId) return;
+  state.jobId = runId;
+  rememberJob(runId);
+  setRunning();
+  pollJob();
+  startPolling();
 }
 
 function showFailure(message) {
@@ -345,7 +393,8 @@ function customerStatus(summary) {
   if (current === "localize") return "Translating";
   if (current === "synthesize") return "Generating voice";
   if (current === "render") return "Rendering";
-  const queued = Object.values(summary.stages || {}).some((status) => status === "queued");
+  const queued = Object.values(summary.stages || {})
+    .some((status) => status === "queued");
   if (summary.status === "queued" || queued) return "Queued";
   const labels = {
     created: "Queued",
@@ -362,8 +411,17 @@ function customerStatus(summary) {
 
 async function getJson(url) {
   const response = await fetch(url);
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || "Request failed.");
+  let payload = {};
+  try {
+    payload = await response.json();
+  } catch (_error) {
+    payload = {};
+  }
+  if (!response.ok) {
+    const error = new Error(payload.error || "Request failed.");
+    error.status = response.status;
+    throw error;
+  }
   return payload;
 }
 

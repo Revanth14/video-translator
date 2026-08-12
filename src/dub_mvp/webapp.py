@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import threading
 import uuid
 import webbrowser
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from dub_mvp.media import MediaIngestor
 from dub_mvp.runner import JobRunner, LocalJobRunner, QueuedJobRunner, StageRequest
 from dub_mvp.timecode import parse_timecode_ms
 from dub_mvp.ui import UiError, build_customer_run_payload
+from dub_mvp.worker import run_worker_loop, run_worker_once
 
 
 class WebAppError(RuntimeError):
@@ -44,14 +46,37 @@ class WebJobService:
         start_background_jobs: bool = True,
     ) -> None:
         self.runs_directory = runs_directory.expanduser().resolve()
-        self.runner = runner or LocalJobRunner(
+        selected_runner = runner or LocalJobRunner(
             ingestor=ingestor or MediaIngestor(),
             transcription_pipeline=transcription_pipeline,
             localization_pipeline=localization_pipeline,
             synthesis_pipeline=synthesis_pipeline,
             render_pipeline=render_pipeline,
-            background=start_background_jobs,
+            background=False,
         )
+        self.runner = QueuedJobRunner()
+        self.worker_runner: LocalJobRunner | None = None
+        self.start_background_jobs = start_background_jobs
+        self._worker_thread: threading.Thread | None = None
+        if isinstance(selected_runner, LocalJobRunner):
+            selected_runner.background = False
+            self.worker_runner = selected_runner
+            if start_background_jobs:
+                self._worker_thread = threading.Thread(
+                    target=run_worker_loop,
+                    kwargs={
+                        "runs_directory": self.runs_directory,
+                        "poll_seconds": 0.25,
+                        "runner": self.worker_runner,
+                    },
+                    daemon=True,
+                    name="video-translator-worker",
+                )
+                self._worker_thread.start()
+        elif not isinstance(selected_runner, QueuedJobRunner):
+            raise WebAppError(
+                "Web jobs require a LocalJobRunner or QueuedJobRunner."
+            )
 
     def create_job(
         self,
@@ -61,6 +86,8 @@ class WebJobService:
         target_language: str,
         start: str = "0",
         end: str = "90",
+        glossary_content: bytes | None = None,
+        voice_reference_content: bytes | None = None,
     ) -> dict[str, Any]:
         if not content:
             raise WebAppError("Uploaded video is empty.")
@@ -75,6 +102,24 @@ class WebJobService:
         input_directory.mkdir(parents=True, exist_ok=True)
         source_path = input_directory / _safe_filename(filename)
         source_path.write_bytes(content)
+        if glossary_content:
+            (input_directory / "glossary.json").write_bytes(glossary_content)
+        voice_reference_path = input_directory / "voice-reference.json"
+        if voice_reference_content:
+            voice_reference_path.write_bytes(voice_reference_content)
+        else:
+            voice_reference_path.write_text(
+                json.dumps(
+                    {
+                        "reference_id": "generic-web-voice",
+                        "path": None,
+                        "consent": "generic voice selected in web app",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
         manifest = RunManifest(
             run_id=run_id,
@@ -84,12 +129,13 @@ class WebJobService:
             target_language=target_language,
         )
         manifest.save(run_directory)
-
         self.runner.submit_ingest(run_directory)
+        self._drain_local_worker()
         return build_customer_run_payload(run_directory)
 
     def run_ingest_now(self, run_directory: Path) -> None:
         self.runner.submit_ingest(run_directory)
+        self._drain_local_worker()
 
     def run_stage(
         self,
@@ -139,7 +185,17 @@ class WebJobService:
                 voice_reference_path=voice_reference_path,
             )
         )
+        self._drain_local_worker()
         return build_customer_run_payload(run_directory)
+
+    def _drain_local_worker(self) -> None:
+        if self.worker_runner is None or self.start_background_jobs:
+            return
+        while run_worker_once(
+            runs_directory=self.runs_directory,
+            runner=self.worker_runner,
+        ).processed:
+            pass
 
 
 class ProductWebServer:
@@ -237,6 +293,14 @@ def _handler_factory(
                 target_language=_field(parts, "language", "hi"),
                 start=_field(parts, "start", "0"),
                 end=_field(parts, "end", "90"),
+                glossary_content=(
+                    parts["glossary"].content if "glossary" in parts else None
+                ),
+                voice_reference_content=(
+                    parts["voice_reference"].content
+                    if "voice_reference" in parts
+                    else None
+                ),
             )
             self._send_json(payload, status=201)
 
@@ -408,7 +472,7 @@ def _parse_time(value: str, label: str) -> int:
 def _build_runner(mode: str | None) -> JobRunner:
     selected = (mode or os.getenv("VIDEO_TRANSLATOR_RUNNER", "local")).lower()
     if selected == "local":
-        return LocalJobRunner(background=True)
+        return LocalJobRunner(background=False)
     if selected in {"queued", "remote"}:
         return QueuedJobRunner()
     raise WebAppError(f"Unknown runner mode: {mode}")
