@@ -19,6 +19,12 @@ from dub_mvp.localize import Glossary, TranslationContext
 from dub_mvp.manifest import RunManifest
 from dub_mvp.media import MediaIngestor, MediaToolError, media_duration_ms
 from dub_mvp.runner import JobRunner, LocalJobRunner, QueuedJobRunner, StageRequest
+from dub_mvp.synthesize import (
+    SynthesisError,
+    VoiceCatalog,
+    VoiceReference,
+    load_voice_catalog,
+)
 from dub_mvp.timecode import parse_timecode_ms
 from dub_mvp.ui import UiError, build_customer_run_payload
 from dub_mvp.upload import StreamedPart, UploadError, parse_multipart_stream
@@ -150,22 +156,12 @@ class WebJobService:
                 input_directory / "translation-context.json",
                 translation_context,
             )
+            voice_catalog = _validated_voice_catalog_input(
+                voice_reference_content
+            )
             voice_reference_path = input_directory / "voice-reference.json"
-            if voice_reference_content:
-                voice_reference_path.write_bytes(voice_reference_content)
-            else:
-                voice_reference_path.write_text(
-                    json.dumps(
-                        {
-                            "reference_id": "generic-web-voice",
-                            "path": None,
-                            "consent": "generic voice selected in web app",
-                        },
-                        indent=2,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
+            _write_model_json(voice_reference_path, voice_catalog)
+            _validate_persisted_voice_catalog(voice_reference_path)
 
             manifest = RunManifest(
                 run_id=run_id,
@@ -241,20 +237,16 @@ class WebJobService:
             voice_reference_path = run_directory / "input" / "voice-reference.json"
             voice_reference_path.parent.mkdir(parents=True, exist_ok=True)
             if voice_reference_content:
-                voice_reference_path.write_bytes(voice_reference_content)
-            elif not voice_reference_path.exists():
-                voice_reference_path.write_text(
-                    json.dumps(
-                        {
-                            "reference_id": "generic-web-voice",
-                            "path": None,
-                            "consent": "generic voice selected in web app",
-                        },
-                        indent=2,
-                    )
-                    + "\n",
-                    encoding="utf-8",
+                _write_model_json(
+                    voice_reference_path,
+                    _validated_voice_catalog_input(voice_reference_content),
                 )
+            elif not voice_reference_path.exists():
+                _write_model_json(
+                    voice_reference_path,
+                    _validated_voice_catalog_input(None),
+                )
+            _validate_persisted_voice_catalog(voice_reference_path)
 
         self.runner.submit_stage(
             StageRequest(
@@ -528,6 +520,33 @@ def _validated_json_input(
         return model.model_validate_json(content)
     except (ValueError, ValidationError) as error:
         raise WebAppError(f"Invalid {label}: {error}") from error
+
+
+def _validated_voice_catalog_input(content: bytes | None) -> VoiceCatalog:
+    if content is None:
+        return VoiceCatalog(
+            voices=[
+                VoiceReference(
+                    reference_id="generic-web-voice",
+                    path=None,
+                    consent="generic voice selected in web app",
+                )
+            ]
+        )
+    try:
+        payload = json.loads(content)
+        if isinstance(payload, dict) and "voices" in payload:
+            return VoiceCatalog.model_validate(payload)
+        return VoiceCatalog(voices=[VoiceReference.model_validate(payload)])
+    except (ValueError, TypeError, ValidationError) as error:
+        raise WebAppError(f"Invalid voice reference: {error}") from error
+
+
+def _validate_persisted_voice_catalog(path: Path) -> None:
+    try:
+        load_voice_catalog(path)
+    except SynthesisError as error:
+        raise WebAppError(str(error)) from error
 
 
 def _write_model_json(path: Path, value: Any) -> None:

@@ -4,7 +4,7 @@ Describes the system as it stands. **Update this file in the same change that
 alters the architecture** — a stale architecture doc is worse than none,
 because agents and new contributors trust it.
 
-Last verified: 2026-08-12 (136 tests passing, including process interruption).
+Last verified: 2026-08-12 (146 tests passing, including process interruption).
 
 ## Non-negotiable invariants
 
@@ -79,9 +79,11 @@ its lease cannot publish over the worker that reclaimed the stage.
 Retries are bounded: `attempt_count` vs `max_attempts`, with exponential
 backoff via `retry_delay_seconds` (30s base, 600s cap). Every attempt is
 appended to `StageRecord.attempts`, and transitions to `StageRecord.events`.
-Translation provider/network errors are retryable; invalid translation inputs
-or responses are terminal. A permanent validation failure therefore cannot
-consume all stage attempts or spin the worker queue.
+Translation provider/network errors and malformed model responses are
+retryable, bounded by `max_attempts`: model output is stochastic, so one bad
+response must not kill a long run, while a systematically bad prompt still
+terminates. Invalid translation *inputs* (missing segments file, corrupt
+glossary, oversized utterance) raise `LocalizationError` and stay terminal.
 
 ### Automatic progression
 
@@ -128,13 +130,15 @@ runs/<run_id>/
 ├── input/          source upload, glossary.json, translation-context.json,
 │                   voice-reference.json
 ├── metadata/       ffprobe, whisperx_raw, transcript, segments,
-│                   synthesized_segments, alignment_plan, job-queue.jsonl
+│                   alignment_plan, job-queue.jsonl
 ├── utterances/     dubbing_utterances.json, translation_segments.json,
 │                   dubbing_utterances.meta.json
 ├── translation/    context snapshot, revisioned aggregate + sidecar,
 │   └── batches/    request, attempts, revisioned result + sidecar per batch
+├── speech/         revisioned aggregate, metrics, run record + sidecars,
+│   ├── voice-maps/ persisted speaker map + sidecar
+│   └── utterances/ attempts, revisioned WAV/result + sidecars per utterance
 ├── working/        source_segment.mp4, source_audio.wav, dubbed_audio.wav
-├── segments/       <segment>/tts-rN.wav  (revisioned, never overwritten)
 ├── subtitles/      hi.srt
 └── outputs/        dubbed_video.mp4
 ```
@@ -193,7 +197,51 @@ reports it or current per-million-token rates are explicitly configured;
 otherwise `cost_status` is `pricing_unavailable`. The aggregate fingerprint,
 provider, model, and cost are also committed to the localize `StageRecord`.
 
-Synthesis writes revisioned audio rather than overwriting.
+### Speech synthesis contract
+
+`voice-reference.json` accepts the current `VoiceCatalog` schema (an ordered
+`voices` list) and migrates the legacy single-`VoiceReference` shape at read
+time. Each reference requires explicit consent metadata. Relative reference
+audio paths resolve from the catalog directory; missing or empty reference
+audio fails before synthesis.
+
+Before the first provider call, `SynthesisPipeline` deterministically assigns
+speakers to the ordered catalog voices and persists a verified
+`SpeakerVoiceMap`. Repeated utterances from one speaker therefore always use
+the same voice. A catalog with one voice deliberately maps every speaker to
+that voice; the system never invents an unconfigured provider voice.
+
+When there are more speakers than voices, assignment wraps and two speakers
+share a voice — audible to a listener but invisible to every automated gate.
+`SpeakerVoiceMap.voice_collisions` derives the sharing from the assignments,
+`SynthesisMetrics` reports `voice_count` and `voice_collision_count`, affected
+utterances carry a note, and the run logs a warning. Sharing is allowed by
+default because the web app supplies a single stock voice; pass
+`--require-distinct-voices` (or `require_distinct_voices=True`) to fail before
+the first provider call instead, which is what a benchmark run should do.
+
+Each localized utterance owns an independent fingerprint, attempt history,
+revisioned WAV, structured result, and checksum/fingerprint sidecars. The
+fingerprint includes the utterance text/timing/revision, speaker, chosen voice
+audio checksum, target language, provider, and model. Restarting synthesis
+reuses each valid utterance independently and calls the provider only for
+missing, failed, stale, or corrupt work. Forced and regenerated speech always
+uses a new revision; a process-death test verifies that completed utterances
+survive when the next provider call terminates the process.
+
+Provider output is first written to a temporary WAV, decoded and fsynced, then
+atomically promoted. Empty, missing, unreadable, invalid, checksum-mismatched,
+and stale audio is never reusable. Duration, sample rate, channel count, and
+sample width are measured from the promoted WAV; a provider-reported duration
+is not authoritative. Synthesis metrics record calls, reuse/regeneration,
+attempts, failures, latency, voice-map/configuration fingerprint, and measured
+generated duration. The provider and fingerprint are committed to the
+`synthesize` stage record.
+
+The aggregate `SynthesizedSegment` schema is version 2 (speaker, voice, and
+speech-artifact provenance). The loader migrates unversioned Phase 0–6
+aggregates as version 1 with optional provenance fields, so in-flight runs can
+still reach render.
 
 ## Web behaviour
 

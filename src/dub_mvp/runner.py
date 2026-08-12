@@ -29,7 +29,11 @@ from dub_mvp.manifest import (
 )
 from dub_mvp.media import MediaIngestor, MediaToolError
 from dub_mvp.render import RenderError, RenderPipeline
-from dub_mvp.synthesize import SynthesisError, SynthesisPipeline
+from dub_mvp.synthesize import (
+    SynthesisError,
+    SynthesisMetrics,
+    SynthesisPipeline,
+)
 from dub_mvp.transcribe import TranscriptionError, TranscriptionPipeline
 from dub_mvp.utterances import UtteranceError, UtterancePipeline
 
@@ -136,11 +140,15 @@ class LocalJobRunner:
         )
         if manifest is None:
             return
-        inputs = _stage_inputs(manifest, request.stage)
-        del manifest
 
+        # Reading the inputs happens inside the guard too: anything that can
+        # raise between claiming a stage and finishing it must still record an
+        # outcome, or the stage sits in RUNNING with no explanation.
         started = time.monotonic()
+        inputs: StageInputs | None = None
         try:
+            inputs = _stage_inputs(manifest, request.stage)
+            del manifest
             outputs, models, media, stage_metadata = self._execute(
                 request,
                 inputs,
@@ -164,7 +172,9 @@ class LocalJobRunner:
                     request.lease is not None
                     and getattr(error, "retryable", True)
                 ),
-                retry_delay_seconds=retry_delay_seconds(inputs.attempt_count),
+                retry_delay_seconds=retry_delay_seconds(
+                    inputs.attempt_count if inputs else 1
+                ),
             )
             return
         except Exception as error:  # noqa: BLE001 - never leave a stage stuck
@@ -262,7 +272,17 @@ class LocalJobRunner:
                 target_language=inputs.target_language,
                 voice_reference_path=request.voice_reference_path,
             )
-            return outputs, {"tts": model_name}, None, {}
+            stage_metadata: dict[str, Any] = {}
+            metrics_path = outputs.get("synthesis_metrics")
+            if metrics_path is not None:
+                metrics = SynthesisMetrics.model_validate_json(
+                    Path(metrics_path).read_text(encoding="utf-8")
+                )
+                stage_metadata = {
+                    "provider": metrics.provider,
+                    "input_fingerprint": metrics.configuration_fingerprint,
+                }
+            return outputs, {"tts": model_name}, None, stage_metadata
         _, outputs = (self.render_pipeline or RenderPipeline()).run(
             synthesized_segments_path=Path(
                 _required_output(inputs, "synthesized_segments")

@@ -22,7 +22,12 @@ from dub_mvp.localize import (
 from dub_mvp.media import MediaIngestor, MediaToolError, media_duration_ms
 from dub_mvp.preflight import build_preflight_report, report_to_json
 from dub_mvp.render import RenderError, RenderPipeline
-from dub_mvp.synthesize import SynthesisError, SynthesisPipeline
+from dub_mvp.synthesize import (
+    SynthesisError,
+    SynthesisMetrics,
+    SynthesisPipeline,
+    synthesis_outputs_reusable,
+)
 from dub_mvp.timecode import parse_timecode_ms
 from dub_mvp.transcribe import TranscriptionError, TranscriptionPipeline
 from dub_mvp.ui import UiServer
@@ -438,7 +443,10 @@ def synthesize(
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="JSON voice reference with explicit consent metadata.",
+        help=(
+            "JSON voice catalog (or legacy single reference) with explicit "
+            "consent metadata."
+        ),
     ),
     force: bool = typer.Option(
         False,
@@ -449,6 +457,14 @@ def synthesize(
         "ai4bharat/IndicF5",
         help="Speech model name to record and load.",
     ),
+    require_distinct_voices: bool = typer.Option(
+        False,
+        "--require-distinct-voices",
+        help=(
+            "Fail when the voice catalog cannot give every speaker its own "
+            "voice, instead of sharing one voice between speakers."
+        ),
+    ),
 ) -> None:
     """Generate one Hindi speech audio artifact per localized segment."""
     try:
@@ -458,16 +474,25 @@ def synthesize(
         raise typer.Exit(code=1) from error
 
     stage = manifest.stages.setdefault("synthesize", StageRecord())
+    localized_output = manifest.outputs.get("localized_segments")
     if (
         not force
         and stage.status == StageStatus.COMPLETED
-        and _synthesize_outputs_exist(stage.outputs)
+        and localized_output is not None
+        and synthesis_outputs_reusable(
+            outputs=stage.outputs,
+            localized_segments_path=Path(localized_output),
+            voice_reference_path=voice_reference,
+            run_directory=run,
+            target_language=manifest.target_language,
+            provider_name="indicf5",
+            model_name=model,
+        )
     ):
         typer.echo(f"Synthesize already complete: {run}")
         typer.echo(json.dumps(manifest.public_summary(), indent=2))
         return
 
-    localized_output = manifest.outputs.get("localized_segments")
     if not localized_output:
         typer.echo("Synthesize requires localized segments.", err=True)
         raise typer.Exit(code=1)
@@ -483,11 +508,13 @@ def synthesize(
     try:
         synthesized_segments, outputs, model_name = SynthesisPipeline(
             model_name=model,
+            require_distinct_voices=require_distinct_voices,
         ).run(
             localized_segments_path=Path(localized_output),
             run_directory=run,
             target_language=manifest.target_language,
             voice_reference_path=voice_reference,
+            reuse_completed_utterances=not force,
         )
     except SynthesisError as error:
         message = str(error)
@@ -508,6 +535,11 @@ def synthesize(
     manifest.status = RunStatus.SYNTHESIZED
     manifest.models["tts"] = model_name
     manifest.outputs.update(outputs)
+    metrics = SynthesisMetrics.model_validate_json(
+        Path(outputs["synthesis_metrics"]).read_text(encoding="utf-8")
+    )
+    stage.provider = metrics.provider
+    stage.input_fingerprint = metrics.configuration_fingerprint
     manifest.timings_seconds["synthesize"] = time.monotonic() - started
     manifest.save(run)
 
@@ -622,7 +654,7 @@ def preflight(
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Optional voice reference JSON to validate.",
+        help="Optional voice catalog or legacy reference JSON to validate.",
     ),
 ) -> None:
     """Check local readiness before provisioning or using GPU runtime."""
@@ -706,7 +738,10 @@ def web(
     runner: str | None = typer.Option(
         None,
         "--runner",
-        help="Job runner mode: local, queued, or remote. Defaults to VIDEO_TRANSLATOR_RUNNER or local.",
+        help=(
+            "Job runner mode: local, queued, or remote. Defaults to "
+            "VIDEO_TRANSLATOR_RUNNER or local."
+        ),
     ),
 ) -> None:
     """Start the no-signup customer video translation web app."""
@@ -809,13 +844,6 @@ def _segment_outputs_exist(outputs: dict[str, str]) -> bool:
         "translation_segments",
         "dubbing_utterances_metadata",
     }
-    return required.issubset(outputs) and all(
-        Path(outputs[name]).is_file() for name in required
-    )
-
-
-def _synthesize_outputs_exist(outputs: dict[str, str]) -> bool:
-    required = {"synthesis_raw", "synthesized_segments"}
     return required.issubset(outputs) and all(
         Path(outputs[name]).is_file() for name in required
     )

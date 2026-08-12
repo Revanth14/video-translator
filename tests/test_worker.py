@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 from dub_mvp.cli import app
 from dub_mvp.localize import (
+    LocalizationError,
     TranslationProviderError,
     TranslationValidationError,
 )
@@ -18,6 +19,7 @@ from dub_mvp.manifest import (
     complete_stage,
     begin_stage,
     fail_stage,
+    mutate_manifest,
     renew_lease,
     retry_delay_seconds,
 )
@@ -468,9 +470,15 @@ def test_transient_translation_failure_queues_bounded_stage_retry(
     assert record.attempts[0].status == StageStatus.FAILED
 
 
-def test_invalid_translation_response_fails_terminally_without_retry(
+def test_invalid_translation_response_retries_then_terminates(
     tmp_path: Path,
 ) -> None:
+    """A malformed model response is retried, but only within max_attempts.
+
+    Model output is stochastic, so one bad response must not kill a long run.
+    A systematically bad prompt still terminates once attempts are spent.
+    """
+
     class InvalidPipeline:
         def run(self, **_):
             raise TranslationValidationError("wrong target language")
@@ -484,12 +492,64 @@ def test_invalid_translation_response_fails_terminally_without_retry(
     segments = run_directory / "translation_segments.json"
     segments.write_text("[]", encoding="utf-8")
     manifest.outputs["translation_segments"] = str(segments)
+    manifest.stages["localize"].max_attempts = 2
+    manifest.save(run_directory)
+
+    runner = LocalJobRunner(
+        localization_pipeline=InvalidPipeline(),
+        background=False,
+    )
+
+    result = run_worker_once(runs_directory=tmp_path, runner=runner)
+    record = RunManifest.load(run_directory).stages["localize"]
+    assert result.status == "queued"
+    assert record.status == StageStatus.QUEUED
+    assert record.next_retry_at is not None
+
+    # Backoff holds the retry until it elapses.
+    assert advance_and_find_job(tmp_path) is None
+    ready = record.next_retry_at + timedelta(seconds=1)
+    assert advance_and_find_job(tmp_path, now=ready) is not None
+
+    # The second attempt exhausts the budget and the stage goes terminal.
+    # run_worker_once reads the real clock, so clear the elapsed backoff.
+    def clear_backoff(manifest: RunManifest) -> None:
+        manifest.stages["localize"].next_retry_at = None
+
+    mutate_manifest(run_directory, clear_backoff)
+    run_worker_once(runs_directory=tmp_path, runner=runner)
+    manifest = RunManifest.load(run_directory)
+    record = manifest.stages["localize"]
+    assert record.status == StageStatus.FAILED
+    assert not record.retryable
+    assert manifest.status == RunStatus.FAILED
+    assert advance_and_find_job(tmp_path, now=ready) is None
+
+
+def test_bad_translation_input_fails_terminally_without_retry(
+    tmp_path: Path,
+) -> None:
+    """Input problems are permanent: retrying cannot fix a missing file."""
+
+    class BrokenInputPipeline:
+        def run(self, **_):
+            raise LocalizationError("Transcript segments are missing.")
+
+    run_directory = tmp_path / "run-b"
+    manifest = write_manifest(
+        run_directory,
+        run_id="run-b",
+        queued_stage="localize",
+    )
+    segments = run_directory / "translation_segments.json"
+    segments.write_text("[]", encoding="utf-8")
+    manifest.outputs["translation_segments"] = str(segments)
     manifest.save(run_directory)
 
     result = run_worker_once(
         runs_directory=tmp_path,
         runner=LocalJobRunner(
-            localization_pipeline=InvalidPipeline(),
+            localization_pipeline=BrokenInputPipeline(),
             background=False,
         ),
     )

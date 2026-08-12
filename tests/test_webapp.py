@@ -271,7 +271,10 @@ def test_web_job_service_persists_inputs_at_creation(tmp_path: Path) -> None:
         source_file=staged_upload(tmp_path),
         target_language="hi",
         glossary_content=b'{"terms":[]}',
-        voice_reference_content=b'{"reference_id":"voice-a","path":null}',
+        voice_reference_content=(
+            b'{"reference_id":"voice-a","path":null,'
+            b'"consent":"approved stock voice"}'
+        ),
     )
     input_directory = tmp_path / payload["summary"]["run_id"] / "input"
 
@@ -286,6 +289,26 @@ def test_web_job_service_persists_inputs_at_creation(tmp_path: Path) -> None:
     assert b'"voice-a"' in (
         input_directory / "voice-reference.json"
     ).read_bytes()
+
+
+def test_web_job_service_rejects_invalid_voice_catalog_before_admission(
+    tmp_path: Path,
+) -> None:
+    service = WebJobService(
+        runs_directory=tmp_path,
+        ingestor=FakeIngestor(),
+        runner=QueuedJobRunner(),
+    )
+
+    with pytest.raises(WebAppError, match="voice reference"):
+        service.create_job(
+            filename="demo.mp4",
+            source_file=staged_upload(tmp_path),
+            target_language="hi",
+            voice_reference_content=b'{"reference_id":"voice-a"}',
+        )
+
+    assert not list(tmp_path.glob("web-*"))
 
 
 def test_web_job_service_rejects_invalid_translation_context_before_admission(

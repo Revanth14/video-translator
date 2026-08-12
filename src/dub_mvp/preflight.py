@@ -10,7 +10,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from dub_mvp.manifest import RunManifest
-from dub_mvp.synthesize import SynthesisError, load_voice_reference
+from dub_mvp.synthesize import SynthesisError, load_voice_catalog
 
 
 class PreflightCheck(BaseModel):
@@ -151,7 +151,7 @@ def _run_checks(run_directory: Path) -> list[PreflightCheck]:
 
 def _voice_reference_check(path: Path) -> PreflightCheck:
     try:
-        reference = load_voice_reference(path)
+        catalog = load_voice_catalog(path)
     except SynthesisError as error:
         return PreflightCheck(
             name="voice_reference",
@@ -162,6 +162,7 @@ def _voice_reference_check(path: Path) -> PreflightCheck:
         name="voice_reference",
         status="pass",
         detail=(
-            f"Loaded {reference.reference_id}; consent: {reference.consent}"
+            f"Loaded {len(catalog.voices)} consented voice(s): "
+            + ", ".join(voice.reference_id for voice in catalog.voices)
         ),
     )

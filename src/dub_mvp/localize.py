@@ -48,7 +48,20 @@ class TranslationProviderError(LocalizationError):
 
 
 class TranslationValidationError(LocalizationError):
-    """A provider response that violates the translation contract."""
+    """A provider response that violates the translation contract.
+
+    Retryable, because every case is the model misbehaving rather than the
+    inputs being wrong: unparseable JSON, a wrong batch id or language, a
+    duplicated, unknown, missing, or reordered utterance. Model output is
+    stochastic, so the next attempt usually succeeds, and a systematically bad
+    prompt still terminates once `max_attempts` is spent. Treating these as
+    permanent let one malformed response kill an entire job.
+
+    Genuinely permanent problems — a missing segments file, a corrupt glossary,
+    an oversized utterance — raise `LocalizationError` and stay terminal.
+    """
+
+    retryable = True
 
 
 class GlossaryTerm(BaseModel):
