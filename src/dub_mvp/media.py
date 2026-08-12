@@ -28,6 +28,14 @@ class MediaIngestor:
         self._runner = runner
         self._resolver = resolver
 
+    def inspect(self, source: Path) -> MediaMetadata:
+        """Inspect source media without creating run artifacts."""
+        source = source.expanduser().resolve()
+        if not source.is_file():
+            raise MediaToolError(f"Input video does not exist: {source}")
+        ffprobe = self._required_tool("ffprobe")
+        return _metadata_from_probe(self._probe(ffprobe, source))
+
     def ingest(
         self,
         source: Path,
@@ -172,6 +180,13 @@ class MediaIngestor:
             detail = result.stderr.strip() or "no error output"
             raise MediaToolError(f"Failed {operation}: {detail}")
         return result
+
+
+def media_duration_ms(metadata: MediaMetadata) -> int:
+    duration_ms = int(round(metadata.duration_seconds * 1000))
+    if duration_ms <= 0:
+        raise MediaToolError("Source duration must be positive.")
+    return duration_ms
 
 
 def _metadata_from_probe(payload: dict[str, Any]) -> MediaMetadata:

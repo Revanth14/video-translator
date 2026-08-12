@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import shutil
 import threading
 import uuid
 import webbrowser
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,22 +14,22 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from dub_mvp.manifest import RunManifest
-from dub_mvp.media import MediaIngestor
+from dub_mvp.media import MediaIngestor, MediaToolError, media_duration_ms
 from dub_mvp.runner import JobRunner, LocalJobRunner, QueuedJobRunner, StageRequest
 from dub_mvp.timecode import parse_timecode_ms
 from dub_mvp.ui import UiError, build_customer_run_payload
+from dub_mvp.upload import StreamedPart, UploadError, parse_multipart_stream
 from dub_mvp.worker import run_worker_loop, run_worker_once
+
+
+MAX_UPLOAD_BYTES = int(
+    os.getenv("VIDEO_TRANSLATOR_MAX_UPLOAD_BYTES", str(8 * 1024**3))
+)
 
 
 class WebAppError(RuntimeError):
     pass
 
-
-@dataclass
-class UploadedPart:
-    name: str
-    filename: str | None
-    content: bytes
 
 
 class WebJobService:
@@ -39,6 +39,7 @@ class WebJobService:
         runs_directory: Path,
         ingestor: MediaIngestor | None = None,
         transcription_pipeline: Any | None = None,
+        utterance_pipeline: Any | None = None,
         localization_pipeline: Any | None = None,
         synthesis_pipeline: Any | None = None,
         render_pipeline: Any | None = None,
@@ -46,9 +47,11 @@ class WebJobService:
         start_background_jobs: bool = True,
     ) -> None:
         self.runs_directory = runs_directory.expanduser().resolve()
+        self.media_ingestor = ingestor or MediaIngestor()
         selected_runner = runner or LocalJobRunner(
-            ingestor=ingestor or MediaIngestor(),
+            ingestor=self.media_ingestor,
             transcription_pipeline=transcription_pipeline,
+            utterance_pipeline=utterance_pipeline,
             localization_pipeline=localization_pipeline,
             synthesis_pipeline=synthesis_pipeline,
             render_pipeline=render_pipeline,
@@ -82,53 +85,81 @@ class WebJobService:
         self,
         *,
         filename: str,
-        content: bytes,
+        source_file: Path,
         target_language: str,
         start: str = "0",
-        end: str = "90",
+        end: str | None = None,
         glossary_content: bytes | None = None,
         voice_reference_content: bytes | None = None,
     ) -> dict[str, Any]:
-        if not content:
+        """Create a run from an already-uploaded file.
+
+        The upload arrives on disk rather than in memory: a creator video is
+        far too large to hold in the web process, let alone on a worker that
+        also holds model weights.
+        """
+        if not source_file.is_file() or source_file.stat().st_size == 0:
             raise WebAppError("Uploaded video is empty.")
         start_ms = _parse_time(start, "start")
-        end_ms = _parse_time(end, "end")
-        if end_ms <= start_ms:
-            raise WebAppError("End time must be greater than start time.")
 
         run_id = _new_web_run_id(filename)
         run_directory = self.runs_directory / run_id
         input_directory = run_directory / "input"
         input_directory.mkdir(parents=True, exist_ok=True)
         source_path = input_directory / _safe_filename(filename)
-        source_path.write_bytes(content)
-        if glossary_content:
-            (input_directory / "glossary.json").write_bytes(glossary_content)
-        voice_reference_path = input_directory / "voice-reference.json"
-        if voice_reference_content:
-            voice_reference_path.write_bytes(voice_reference_content)
-        else:
-            voice_reference_path.write_text(
-                json.dumps(
-                    {
-                        "reference_id": "generic-web-voice",
-                        "path": None,
-                        "consent": "generic voice selected in web app",
-                    },
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+        shutil.move(str(source_file), str(source_path))
 
-        manifest = RunManifest(
-            run_id=run_id,
-            source_path=str(source_path),
-            source_start_ms=start_ms,
-            source_end_ms=end_ms,
-            target_language=target_language,
-        )
-        manifest.save(run_directory)
+        # A rejected upload must not leave a half-built run behind for the
+        # worker to discover.
+        try:
+            try:
+                source_duration_ms = media_duration_ms(
+                    self.media_ingestor.inspect(source_path)
+                )
+            except MediaToolError as error:
+                raise WebAppError(str(error)) from error
+            end_ms = (
+                _parse_time(end, "end")
+                if end is not None and end.strip()
+                else source_duration_ms
+            )
+            if end_ms <= start_ms:
+                raise WebAppError("End time must be greater than start time.")
+            if end_ms > source_duration_ms + 100:
+                raise WebAppError(
+                    "End time exceeds the source duration "
+                    f"({source_duration_ms / 1000:.3f}s)."
+                )
+            if glossary_content:
+                (input_directory / "glossary.json").write_bytes(glossary_content)
+            voice_reference_path = input_directory / "voice-reference.json"
+            if voice_reference_content:
+                voice_reference_path.write_bytes(voice_reference_content)
+            else:
+                voice_reference_path.write_text(
+                    json.dumps(
+                        {
+                            "reference_id": "generic-web-voice",
+                            "path": None,
+                            "consent": "generic voice selected in web app",
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+            manifest = RunManifest(
+                run_id=run_id,
+                source_path=str(source_path),
+                source_start_ms=start_ms,
+                source_end_ms=end_ms,
+                target_language=target_language,
+            )
+            manifest.save(run_directory)
+        except Exception:
+            shutil.rmtree(run_directory, ignore_errors=True)
+            raise
         self.runner.submit_ingest(run_directory)
         self._drain_local_worker()
         return build_customer_run_payload(run_directory)
@@ -148,7 +179,13 @@ class WebJobService:
         run_directory = _safe_join(self.runs_directory, run_id)
         if not run_directory.is_dir():
             raise WebAppError(f"Unknown job: {run_id}")
-        if stage not in {"transcribe", "localize", "synthesize", "render"}:
+        if stage not in {
+            "transcribe",
+            "segment",
+            "localize",
+            "synthesize",
+            "render",
+        }:
             raise WebAppError(f"Unknown stage: {stage}")
 
         glossary_path = None
@@ -269,7 +306,7 @@ def _handler_factory(
                     self._run_stage(parsed.path)
                 else:
                     self.send_error(404)
-            except WebAppError as error:
+            except (WebAppError, UploadError) as error:
                 self._send_json({"error": str(error)}, status=400)
             except (OSError, ValueError) as error:
                 self._send_json({"error": str(error)}, status=500)
@@ -279,29 +316,54 @@ def _handler_factory(
 
         def _create_job(self) -> None:
             content_length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(content_length)
-            parts = _parse_multipart(
-                body,
-                self.headers.get("Content-Type", ""),
-            )
-            video = parts.get("video")
-            if video is None or video.filename is None:
-                raise WebAppError("Upload must include a video file.")
-            payload = job_service.create_job(
-                filename=video.filename,
-                content=video.content,
-                target_language=_field(parts, "language", "hi"),
-                start=_field(parts, "start", "0"),
-                end=_field(parts, "end", "90"),
-                glossary_content=(
-                    parts["glossary"].content if "glossary" in parts else None
-                ),
-                voice_reference_content=(
-                    parts["voice_reference"].content
-                    if "voice_reference" in parts
-                    else None
-                ),
-            )
+            if content_length > MAX_UPLOAD_BYTES:
+                raise WebAppError(
+                    "Upload exceeds the maximum size of "
+                    f"{MAX_UPLOAD_BYTES // (1024 ** 3)} GB."
+                )
+            staging_directory = runs_directory / ".uploads"
+            staged: list[Path] = []
+
+            def sink(name: str, filename: str | None) -> Path | None:
+                # Only the video streams to disk; the rest are small fields.
+                if name != "video" or not filename:
+                    return None
+                destination = staging_directory / f"{uuid.uuid4().hex}.upload"
+                staged.append(destination)
+                return destination
+
+            try:
+                parts = parse_multipart_stream(
+                    self.rfile,
+                    content_type=self.headers.get("Content-Type", ""),
+                    content_length=content_length,
+                    file_sink=sink,
+                )
+                video = parts.get("video")
+                if video is None or video.path is None or not video.filename:
+                    raise WebAppError("Upload must include a video file.")
+                payload = job_service.create_job(
+                    filename=video.filename,
+                    source_file=video.path,
+                    target_language=_field(parts, "language", "hi"),
+                    start=_field(parts, "start", "0"),
+                    end=_optional_field(parts, "end"),
+                    glossary_content=(
+                        parts["glossary"].content
+                        if "glossary" in parts
+                        else None
+                    ),
+                    voice_reference_content=(
+                        parts["voice_reference"].content
+                        if "voice_reference" in parts
+                        else None
+                    ),
+                )
+            finally:
+                # create_job moves the upload into the run on success; anything
+                # still staged belongs to a failed request.
+                for path in staged:
+                    path.unlink(missing_ok=True)
             self._send_json(payload, status=201)
 
         def _run_stage(self, path: str) -> None:
@@ -309,11 +371,16 @@ def _handler_factory(
             rest = path.removeprefix(prefix)
             run_id, _, stage = rest.partition("/stages/")
             content_length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(content_length)
-            parts = {}
             content_type = self.headers.get("Content-Type", "")
-            if body and "multipart/form-data" in content_type:
-                parts = _parse_multipart(body, content_type)
+            parts: dict[str, StreamedPart] = {}
+            if content_length > 0 and "multipart/form-data" in content_type:
+                # Operator inputs only (glossary, voice reference), so every
+                # part stays buffered under the field limit.
+                parts = parse_multipart_stream(
+                    self.rfile,
+                    content_type=content_type,
+                    content_length=content_length,
+                )
             payload = job_service.run_stage(
                 run_id=unquote(run_id),
                 stage=unquote(stage),
@@ -370,60 +437,11 @@ def _load_job(runs_directory: Path, run_id: str) -> dict[str, Any]:
     return build_customer_run_payload(run_directory)
 
 
-def _parse_multipart(
-    body: bytes,
-    content_type: str,
-) -> dict[str, UploadedPart]:
-    marker = "boundary="
-    if marker not in content_type:
-        raise WebAppError("Expected multipart form upload.")
-    boundary = content_type.split(marker, 1)[1].split(";", 1)[0].strip()
-    if boundary.startswith('"') and boundary.endswith('"'):
-        boundary = boundary[1:-1]
-    delimiter = f"--{boundary}".encode("utf-8")
-    parts: dict[str, UploadedPart] = {}
-    for raw_part in body.split(delimiter):
-        raw_part = raw_part.strip()
-        if not raw_part or raw_part == b"--":
-            continue
-        if raw_part.endswith(b"--"):
-            raw_part = raw_part[:-2].strip()
-        header_blob, _, content = raw_part.partition(b"\r\n\r\n")
-        if not header_blob or not content:
-            continue
-        headers = _part_headers(header_blob)
-        disposition = headers.get("content-disposition", "")
-        name = _disposition_value(disposition, "name")
-        if not name:
-            continue
-        filename = _disposition_value(disposition, "filename")
-        parts[name] = UploadedPart(
-            name=name,
-            filename=filename,
-            content=content.rstrip(b"\r\n"),
-        )
-    return parts
 
-
-def _part_headers(header_blob: bytes) -> dict[str, str]:
-    headers = {}
-    for line in header_blob.decode("utf-8", errors="replace").split("\r\n"):
-        name, _, value = line.partition(":")
-        if name and value:
-            headers[name.lower()] = value.strip()
-    return headers
-
-
-def _disposition_value(disposition: str, key: str) -> str | None:
-    for item in disposition.split(";"):
-        name, _, value = item.strip().partition("=")
-        if name == key:
-            return value.strip().strip('"')
-    return None
 
 
 def _field(
-    parts: dict[str, UploadedPart],
+    parts: dict[str, StreamedPart],
     name: str,
     default: str,
 ) -> str:
@@ -432,6 +450,16 @@ def _field(
         return default
     value = part.content.decode("utf-8", errors="replace").strip()
     return value or default
+
+
+def _optional_field(
+    parts: dict[str, StreamedPart],
+    name: str,
+) -> str | None:
+    part = parts.get(name)
+    if part is None:
+        return None
+    return part.content.decode("utf-8", errors="replace").strip() or None
 
 
 def _safe_join(root: Path, relative: str) -> Path:

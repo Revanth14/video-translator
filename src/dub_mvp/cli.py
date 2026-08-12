@@ -15,13 +15,14 @@ from dub_mvp.manifest import (
     StageStatus,
 )
 from dub_mvp.localize import LocalizationError, LocalizationPipeline
-from dub_mvp.media import MediaIngestor, MediaToolError
+from dub_mvp.media import MediaIngestor, MediaToolError, media_duration_ms
 from dub_mvp.preflight import build_preflight_report, report_to_json
 from dub_mvp.render import RenderError, RenderPipeline
 from dub_mvp.synthesize import SynthesisError, SynthesisPipeline
 from dub_mvp.timecode import parse_timecode_ms
 from dub_mvp.transcribe import TranscriptionError, TranscriptionPipeline
 from dub_mvp.ui import UiServer
+from dub_mvp.utterances import UtteranceError, UtterancePipeline
 from dub_mvp.webapp import ProductWebServer
 from dub_mvp.worker import WorkerError, run_worker_loop, run_worker_once
 
@@ -44,7 +45,10 @@ def ingest(
         help="Source video file.",
     ),
     start: str = typer.Option("0", help="Start as seconds or HH:MM:SS."),
-    end: str = typer.Option(..., help="End as seconds or HH:MM:SS."),
+    end: str | None = typer.Option(
+        None,
+        help="Optional end as seconds or HH:MM:SS; defaults to full duration.",
+    ),
     output: Path = typer.Option(
         Path("runs"),
         help="Parent directory for generated runs.",
@@ -57,8 +61,13 @@ def ingest(
     """Inspect and extract a source range into a new resumable run."""
     try:
         start_ms = parse_timecode_ms(start)
-        end_ms = parse_timecode_ms(end)
-    except ValueError as error:
+        ingestor = MediaIngestor()
+        end_ms = (
+            parse_timecode_ms(end)
+            if end is not None
+            else media_duration_ms(ingestor.inspect(input))
+        )
+    except (ValueError, MediaToolError) as error:
         raise typer.BadParameter(str(error)) from error
     if end_ms <= start_ms:
         raise typer.BadParameter("End time must be greater than start time.")
@@ -81,7 +90,7 @@ def ingest(
 
     started = time.monotonic()
     try:
-        metadata, outputs = MediaIngestor().ingest(
+        metadata, outputs = ingestor.ingest(
             source=input,
             run_directory=run_directory,
             start_ms=start_ms,
@@ -202,6 +211,87 @@ def transcribe(
 
 
 @app.command()
+def segment(
+    run: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Existing run directory with transcription outputs.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Rebuild dubbing utterances even when outputs exist.",
+    ),
+) -> None:
+    """Create stable, speaker-aware dubbing utterances for localization."""
+    try:
+        manifest = RunManifest.load(run)
+    except (OSError, ValueError) as error:
+        typer.echo(f"Unable to read run manifest: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
+    stage = manifest.stages.setdefault("segment", StageRecord())
+    if (
+        not force
+        and stage.status == StageStatus.COMPLETED
+        and _segment_outputs_exist(stage.outputs)
+    ):
+        typer.echo(f"Segment already complete: {run}")
+        typer.echo(json.dumps(manifest.public_summary(), indent=2))
+        return
+
+    transcript_output = manifest.outputs.get("transcript")
+    segments_output = manifest.outputs.get("segments")
+    if not transcript_output or not segments_output:
+        typer.echo("Segment requires completed transcription outputs.", err=True)
+        raise typer.Exit(code=1)
+
+    stage.status = StageStatus.RUNNING
+    stage.started_at = datetime.now(timezone.utc)
+    stage.completed_at = None
+    stage.error = None
+    manifest.status = RunStatus.RUNNING
+    manifest.save(run)
+
+    started = time.monotonic()
+    try:
+        artifact, translation_segments, outputs = UtterancePipeline().run(
+            transcript_path=Path(transcript_output),
+            segments_path=Path(segments_output),
+            run_directory=run,
+        )
+    except UtteranceError as error:
+        message = str(error)
+        stage.status = StageStatus.FAILED
+        stage.error = message
+        stage.completed_at = datetime.now(timezone.utc)
+        manifest.status = RunStatus.FAILED
+        manifest.errors.append(message)
+        manifest.timings_seconds["segment"] = time.monotonic() - started
+        manifest.save(run)
+        typer.echo(f"Segment failed: {message}", err=True)
+        typer.echo(f"Run manifest: {run / 'manifest.json'}")
+        raise typer.Exit(code=1) from error
+
+    stage.status = StageStatus.COMPLETED
+    stage.completed_at = datetime.now(timezone.utc)
+    stage.outputs = outputs
+    manifest.status = RunStatus.SEGMENTED
+    manifest.outputs.update(outputs)
+    manifest.timings_seconds["segment"] = time.monotonic() - started
+    manifest.save(run)
+
+    typer.echo(f"Segment complete: {run}")
+    typer.echo(f"Utterances: {len(artifact.utterances)}")
+    typer.echo(f"Translation segments: {len(translation_segments)}")
+    typer.echo(json.dumps(manifest.public_summary(), indent=2))
+
+
+@app.command()
 def localize(
     run: Path = typer.Argument(
         ...,
@@ -249,7 +339,9 @@ def localize(
         typer.echo(json.dumps(manifest.public_summary(), indent=2))
         return
 
-    segments_output = manifest.outputs.get("segments")
+    segments_output = manifest.outputs.get(
+        "translation_segments"
+    ) or manifest.outputs.get("segments")
     if not segments_output:
         typer.echo("Localize requires completed transcription segments.", err=True)
         raise typer.Exit(code=1)
@@ -678,6 +770,17 @@ def _new_run_id(name: str) -> str:
 
 def _transcribe_outputs_exist(outputs: dict[str, str]) -> bool:
     required = {"whisperx_raw", "transcript", "segments"}
+    return required.issubset(outputs) and all(
+        Path(outputs[name]).is_file() for name in required
+    )
+
+
+def _segment_outputs_exist(outputs: dict[str, str]) -> bool:
+    required = {
+        "dubbing_utterances",
+        "translation_segments",
+        "dubbing_utterances_metadata",
+    }
     return required.issubset(outputs) and all(
         Path(outputs[name]).is_file() for name in required
     )

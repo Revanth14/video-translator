@@ -76,6 +76,7 @@ def build_customer_run_payload(run_directory: Path) -> dict[str, Any]:
         "summary": summary.model_dump(mode="json"),
         "segments": _read_json_output(
             manifest.outputs.get("localized_segments")
+            or manifest.outputs.get("translation_segments")
             or manifest.outputs.get("segments")
         ),
         "synthesized_segments": _read_json_output(
@@ -125,6 +126,7 @@ def demo_payload() -> dict[str, Any]:
             "stages": {
                 "ingest": "completed",
                 "transcribe": "completed",
+                "segment": "completed",
                 "localize": "completed",
                 "synthesize": "completed",
                 "render": "completed",
@@ -280,7 +282,10 @@ def _run_metrics(
     run_directory: Path,
 ) -> dict[str, Any]:
     segments = _as_list(
-        _read_json_output(manifest.outputs.get("segments"))
+        _read_json_output(
+            manifest.outputs.get("translation_segments")
+            or manifest.outputs.get("segments")
+        )
     )
     localized = _as_list(
         _read_json_output(manifest.outputs.get("localized_segments"))
@@ -653,6 +658,7 @@ HTML = r"""<!doctype html>
     const stageLabels = {
       ingest: "Media prepared",
       transcribe: "English transcript",
+      segment: "Dubbing utterances",
       localize: "Hindi adaptation",
       synthesize: "Hindi voice",
       render: "Final video"

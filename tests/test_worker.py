@@ -24,7 +24,7 @@ from dub_mvp.worker import (
     QueuedJob,
     WorkerResult,
     claim_job,
-    find_next_queued_job,
+    advance_and_find_job,
     run_worker_loop,
     run_worker_once,
 )
@@ -53,6 +53,7 @@ class RecordingRunner:
         manifest.status = {
             "ingest": RunStatus.INGESTED,
             "transcribe": RunStatus.TRANSCRIBED,
+            "segment": RunStatus.SEGMENTED,
             "localize": RunStatus.LOCALIZED,
             "synthesize": RunStatus.SYNTHESIZED,
             "render": RunStatus.RENDERED,
@@ -76,6 +77,7 @@ def write_manifest(
         queued_index = [
             "ingest",
             "transcribe",
+            "segment",
             "localize",
             "synthesize",
             "render",
@@ -83,6 +85,7 @@ def write_manifest(
         for completed_stage in [
             "ingest",
             "transcribe",
+            "segment",
             "localize",
             "synthesize",
             "render",
@@ -94,7 +97,7 @@ def write_manifest(
     return manifest
 
 
-def test_find_next_queued_job_uses_stage_order(tmp_path: Path) -> None:
+def test_advance_and_find_job_uses_stage_order(tmp_path: Path) -> None:
     run_directory = tmp_path / "run-a"
     manifest = write_manifest(run_directory, run_id="run-a")
     manifest.status = RunStatus.QUEUED
@@ -103,7 +106,7 @@ def test_find_next_queued_job_uses_stage_order(tmp_path: Path) -> None:
     manifest.stages["transcribe"].status = StageStatus.QUEUED
     manifest.save(run_directory)
 
-    job = find_next_queued_job(tmp_path)
+    job = advance_and_find_job(tmp_path)
 
     assert job == QueuedJob(
         run_directory=run_directory,
@@ -167,7 +170,7 @@ def test_claim_job_retires_a_stage_that_exhausted_its_attempts(
     assert reloaded.status == RunStatus.FAILED
     # A terminal stage must stop being claimable, otherwise the worker loop
     # spins on it forever and starves every other run.
-    assert find_next_queued_job(tmp_path) is None
+    assert advance_and_find_job(tmp_path) is None
 
 
 def test_expired_lease_is_reclaimed_by_another_worker(tmp_path: Path) -> None:
@@ -184,10 +187,10 @@ def test_expired_lease_is_reclaimed_by_another_worker(tmp_path: Path) -> None:
     assert first is not None
 
     # A live lease keeps the stage off the queue.
-    assert find_next_queued_job(tmp_path, now=start + timedelta(seconds=30)) is None
+    assert advance_and_find_job(tmp_path, now=start + timedelta(seconds=30)) is None
 
     expired = start + timedelta(seconds=90)
-    assert find_next_queued_job(tmp_path, now=expired) == job
+    assert advance_and_find_job(tmp_path, now=expired) == job
 
     second = claim_job(job, worker_id="worker-b", lease_seconds=60, now=expired)
     assert second is not None
@@ -294,8 +297,8 @@ def test_retryable_failure_waits_for_backoff_before_being_claimable(
     assert record.attempts[0].status == StageStatus.FAILED
     assert record.next_retry_at == start + timedelta(seconds=30)
 
-    assert find_next_queued_job(tmp_path, now=start + timedelta(seconds=10)) is None
-    assert find_next_queued_job(tmp_path, now=start + timedelta(seconds=31)) == job
+    assert advance_and_find_job(tmp_path, now=start + timedelta(seconds=10)) is None
+    assert advance_and_find_job(tmp_path, now=start + timedelta(seconds=31)) == job
 
 
 def test_heartbeat_renews_record_and_attempt(tmp_path: Path) -> None:
@@ -441,13 +444,14 @@ def test_worker_automatically_progresses_through_all_stages(
 
     results = [
         run_worker_once(runs_directory=tmp_path, runner=runner)
-        for _ in range(5)
+        for _ in range(6)
     ]
     manifest = RunManifest.load(run_directory)
 
     assert [result.stage for result in results] == [
         "ingest",
         "transcribe",
+        "segment",
         "localize",
         "synthesize",
         "render",

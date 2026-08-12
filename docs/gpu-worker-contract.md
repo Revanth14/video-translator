@@ -5,9 +5,10 @@ for its durable replacement.
 
 ## Current contract
 
-- The web process creates a run and marks a requested stage `queued`.
+- The web process persists all required inputs, creates a run, and queues ingest.
 - Queue events are appended to `metadata/job-queue.jsonl`.
-- The worker scans `*/manifest.json` files for queued stages.
+- The worker scans `*/manifest.json` files and advances the dependency chain:
+  `ingest -> transcribe -> segment -> localize -> synthesize -> render`.
 - A synchronous `LocalJobRunner` executes the selected stage.
 - Stage outputs and final state are written back to the run manifest.
 
@@ -16,10 +17,15 @@ scaffold.
 
 ## Current safety boundary
 
-The current load/check/save claim is not a safe multi-worker compare-and-set
-operation. Run only one worker against a shared filesystem.
+Manifest mutations use a per-run file lock and revision check. Claims include a
+worker identity, expiring lease, heartbeat, and monotonically increasing fencing
+generation. Expired work can be reclaimed, and stale workers cannot commit.
 
-## Target contract
+This safety applies to workers sharing one local POSIX filesystem. Network file
+systems and distributed deployments still need a durable state backend with
+real conditional writes.
+
+## Distributed target contract
 
 The durable state backend will expose operations equivalent to:
 
@@ -39,4 +45,3 @@ will be rejected so a stale worker cannot overwrite reclaimed work.
 
 Artifacts will be reusable only when their sidecar validates status, path,
 checksum, schema, and input fingerprint.
-

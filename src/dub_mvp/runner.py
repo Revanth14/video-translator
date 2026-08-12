@@ -26,14 +26,16 @@ from dub_mvp.media import MediaIngestor, MediaToolError
 from dub_mvp.render import RenderError, RenderPipeline
 from dub_mvp.synthesize import SynthesisError, SynthesisPipeline
 from dub_mvp.transcribe import TranscriptionError, TranscriptionPipeline
+from dub_mvp.utterances import UtteranceError, UtterancePipeline
 
 
-HEAVY_STAGES = {"transcribe", "localize", "synthesize", "render"}
+HEAVY_STAGES = {"transcribe", "segment", "localize", "synthesize", "render"}
 RUNNABLE_STAGES = {"ingest", *HEAVY_STAGES}
 
 STAGE_RUN_STATUS = {
     "ingest": RunStatus.INGESTED,
     "transcribe": RunStatus.TRANSCRIBED,
+    "segment": RunStatus.SEGMENTED,
     "localize": RunStatus.LOCALIZED,
     "synthesize": RunStatus.SYNTHESIZED,
     "render": RunStatus.RENDERED,
@@ -67,6 +69,7 @@ class LocalJobRunner:
         *,
         ingestor: MediaIngestor | None = None,
         transcription_pipeline: Any | None = None,
+        utterance_pipeline: Any | None = None,
         localization_pipeline: Any | None = None,
         synthesis_pipeline: Any | None = None,
         render_pipeline: Any | None = None,
@@ -74,6 +77,7 @@ class LocalJobRunner:
     ) -> None:
         self.ingestor = ingestor or MediaIngestor()
         self.transcription_pipeline = transcription_pipeline
+        self.utterance_pipeline = utterance_pipeline
         self.localization_pipeline = localization_pipeline
         self.synthesis_pipeline = synthesis_pipeline
         self.render_pipeline = render_pipeline
@@ -119,6 +123,7 @@ class LocalJobRunner:
             JobRunnerError,
             MediaToolError,
             TranscriptionError,
+            UtteranceError,
             LocalizationError,
             SynthesisError,
             RenderError,
@@ -182,11 +187,22 @@ class LocalJobRunner:
                 duration_ms=manifest.duration_ms,
             )
             return outputs, {"whisperx": transcript.model}, None
+        if request.stage == "segment":
+            _, _, outputs = (
+                self.utterance_pipeline or UtterancePipeline()
+            ).run(
+                transcript_path=Path(_required_output(manifest, "transcript")),
+                segments_path=Path(_required_output(manifest, "segments")),
+                run_directory=request.run_directory,
+            )
+            return outputs, {}, None
         if request.stage == "localize":
             _, outputs, model_name = (
                 self.localization_pipeline or LocalizationPipeline()
             ).run(
-                segments_path=Path(_required_output(manifest, "segments")),
+                segments_path=Path(
+                    _required_output(manifest, "translation_segments")
+                ),
                 run_directory=request.run_directory,
                 source_language=manifest.source_language,
                 target_language=manifest.target_language,

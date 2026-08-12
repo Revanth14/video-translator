@@ -121,6 +121,8 @@ def _run_checks(run_directory: Path) -> list[PreflightCheck]:
         "source_segment",
         "working_audio",
         "segments",
+        "dubbing_utterances",
+        "translation_segments",
         "localized_segments",
         "synthesized_segments",
     ]

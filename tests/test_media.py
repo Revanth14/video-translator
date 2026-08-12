@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from dub_mvp.media import MediaIngestor, MediaToolError
+from dub_mvp.media import MediaIngestor, MediaToolError, media_duration_ms
 
 
 PROBE_PAYLOAD = {
@@ -74,6 +74,17 @@ def test_ingest_creates_expected_artifacts(tmp_path: Path) -> None:
     assert "-ss" in runner.commands[1]
     assert "1.000" in runner.commands[1]
     assert "10.000" in runner.commands[1]
+
+
+def test_inspect_reports_full_source_duration(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    source.touch()
+    runner = FakeRunner()
+
+    metadata = MediaIngestor(runner=runner, resolver=resolver).inspect(source)
+
+    assert media_duration_ms(metadata) == 120500
+    assert len(runner.commands) == 1
 
 
 def test_ingest_reports_missing_media_tools(tmp_path: Path) -> None:

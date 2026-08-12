@@ -1,4 +1,6 @@
+from io import BytesIO
 from pathlib import Path
+from uuid import uuid4
 from types import SimpleNamespace
 
 from typer.testing import CliRunner
@@ -6,15 +8,25 @@ from typer.testing import CliRunner
 from dub_mvp.cli import app
 from dub_mvp.manifest import MediaMetadata, RunManifest, RunStatus, StageStatus
 from dub_mvp.runner import QueuedJobRunner
+from dub_mvp.upload import parse_multipart_stream
 from dub_mvp.webapp import (
     WebJobService,
     _build_runner,
-    _parse_multipart,
     _safe_filename,
 )
 
 
 class FakeIngestor:
+    def inspect(self, source: Path) -> MediaMetadata:
+        assert source.is_file()
+        return MediaMetadata(
+            duration_seconds=120,
+            video_codec="h264",
+            width=1920,
+            height=1080,
+            audio_codec="aac",
+        )
+
     def ingest(
         self,
         *,
@@ -25,7 +37,7 @@ class FakeIngestor:
     ):
         assert source.is_file()
         assert start_ms == 0
-        assert end_ms == 90000
+        assert end_ms == 120000
         working = run_directory / "working"
         metadata = run_directory / "metadata"
         working.mkdir(parents=True, exist_ok=True)
@@ -64,8 +76,27 @@ class FakeTranscriptionPipeline:
         }
 
 
-class FakeLocalizationPipeline:
+class FakeUtterancePipeline:
     def run(self, *, run_directory: Path, **_):
+        utterance_directory = run_directory / "utterances"
+        utterance_directory.mkdir()
+        artifact = utterance_directory / "dubbing_utterances.json"
+        translation = utterance_directory / "translation_segments.json"
+        sidecar = utterance_directory / "dubbing_utterances.meta.json"
+        artifact.write_text('{"utterances":[]}', encoding="utf-8")
+        translation.write_text("[]", encoding="utf-8")
+        sidecar.write_text("{}", encoding="utf-8")
+        return SimpleNamespace(utterances=[]), [], {
+            "dubbing_utterances": str(artifact),
+            "translation_segments": str(translation),
+            "dubbing_utterances_metadata": str(sidecar),
+        }
+
+
+class FakeLocalizationPipeline:
+    def run(self, *, run_directory: Path, segments_path: Path, **_):
+        assert segments_path.name == "translation_segments.json"
+        assert segments_path.is_file()
         raw = run_directory / "metadata" / "localization_raw.json"
         localized = run_directory / "metadata" / "localized_segments.json"
         raw.write_text("{}", encoding="utf-8")
@@ -123,10 +154,22 @@ def multipart_body() -> tuple[bytes, str]:
     return body, f"multipart/form-data; boundary={boundary}"
 
 
+def staged_upload(tmp_path: Path, data: bytes = b"video") -> Path:
+    """An upload already written to disk, as the streaming handler leaves it."""
+    staged = tmp_path / ".uploads" / f"{uuid4().hex}.upload"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(data)
+    return staged
+
+
 def test_parse_multipart_upload() -> None:
     body, content_type = multipart_body()
 
-    parts = _parse_multipart(body, content_type)
+    parts = parse_multipart_stream(
+        BytesIO(body),
+        content_type=content_type,
+        content_length=len(body),
+    )
 
     assert parts["language"].content == b"hi"
     assert parts["video"].filename == "demo video.mp4"
@@ -142,7 +185,7 @@ def test_web_job_service_creates_run_and_ingests(tmp_path: Path) -> None:
 
     payload = service.create_job(
         filename="demo video.mp4",
-        content=b"video-bytes",
+        source_file=staged_upload(tmp_path, b"video-bytes"),
         target_language="hi",
     )
     run_id = payload["summary"]["run_id"]
@@ -151,6 +194,7 @@ def test_web_job_service_creates_run_and_ingests(tmp_path: Path) -> None:
 
     assert manifest.status == RunStatus.QUEUED
     assert manifest.target_language == "hi"
+    assert manifest.source_end_ms == 120000
     assert manifest.stages["ingest"].status == StageStatus.COMPLETED
     assert manifest.stages["transcribe"].status == StageStatus.QUEUED
     assert Path(manifest.outputs["working_audio"]).is_file()
@@ -161,6 +205,7 @@ def test_web_job_service_runs_full_customer_lifecycle(tmp_path: Path) -> None:
         runs_directory=tmp_path,
         ingestor=FakeIngestor(),
         transcription_pipeline=FakeTranscriptionPipeline(),
+        utterance_pipeline=FakeUtterancePipeline(),
         localization_pipeline=FakeLocalizationPipeline(),
         synthesis_pipeline=FakeSynthesisPipeline(),
         render_pipeline=FakeRenderPipeline(),
@@ -168,7 +213,7 @@ def test_web_job_service_runs_full_customer_lifecycle(tmp_path: Path) -> None:
     )
     payload = service.create_job(
         filename="demo.mp4",
-        content=b"video",
+        source_file=staged_upload(tmp_path),
         target_language="hi",
     )
     run_id = payload["summary"]["run_id"]
@@ -186,12 +231,13 @@ def test_web_job_service_runs_full_customer_lifecycle(tmp_path: Path) -> None:
 def test_web_job_service_persists_inputs_at_creation(tmp_path: Path) -> None:
     service = WebJobService(
         runs_directory=tmp_path,
+        ingestor=FakeIngestor(),
         runner=QueuedJobRunner(),
     )
 
     payload = service.create_job(
         filename="demo.mp4",
-        content=b"video",
+        source_file=staged_upload(tmp_path),
         target_language="hi",
         glossary_content=b'{"terms":[]}',
         voice_reference_content=b'{"reference_id":"voice-a","path":null}',
@@ -207,12 +253,13 @@ def test_web_job_service_persists_inputs_at_creation(tmp_path: Path) -> None:
 def test_web_job_service_can_queue_without_local_execution(tmp_path: Path) -> None:
     service = WebJobService(
         runs_directory=tmp_path,
+        ingestor=FakeIngestor(),
         runner=QueuedJobRunner(),
     )
 
     payload = service.create_job(
         filename="demo.mp4",
-        content=b"video",
+        source_file=staged_upload(tmp_path),
         target_language="hi",
     )
     run_id = payload["summary"]["run_id"]
@@ -235,7 +282,7 @@ def test_web_job_service_does_not_duplicate_already_queued_stage(
     )
     payload = service.create_job(
         filename="demo.mp4",
-        content=b"video",
+        source_file=staged_upload(tmp_path),
         target_language="hi",
     )
     run_id = payload["summary"]["run_id"]

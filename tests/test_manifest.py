@@ -42,11 +42,34 @@ def test_manifest_summary_omits_internal_media_detail() -> None:
     assert manifest.public_summary()["stages"] == {
         "ingest": "pending",
         "transcribe": "pending",
+        "segment": "pending",
         "localize": "pending",
         "synthesize": "pending",
         "render": "pending",
     }
     assert manifest.public_summary()["source_language"] == "en"
+
+
+def test_old_manifest_gains_segment_stage_without_reopening_completed_work() -> None:
+    manifest = RunManifest(
+        run_id="test-run",
+        source_path="source.mp4",
+        source_start_ms=0,
+        source_end_ms=1000,
+    )
+    manifest.outputs["segments"] = "/tmp/segments.json"
+    manifest.stages["transcribe"].status = StageStatus.COMPLETED
+    manifest.stages["localize"].status = StageStatus.COMPLETED
+    payload = manifest.model_dump(mode="json")
+    del payload["stages"]["segment"]
+
+    migrated = RunManifest.model_validate(payload)
+
+    assert migrated.stages["segment"].status == StageStatus.COMPLETED
+    assert (
+        migrated.outputs["translation_segments"]
+        == migrated.outputs["segments"]
+    )
 
 
 def test_stage_record_supports_durable_attempt_and_lease_metadata() -> None:

@@ -11,11 +11,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 BASE_RETRY_BACKOFF_SECONDS = 30
 MAX_RETRY_BACKOFF_SECONDS = 600
+PIPELINE_STAGE_NAMES = (
+    "ingest",
+    "transcribe",
+    "segment",
+    "localize",
+    "synthesize",
+    "render",
+)
 
 
 class ManifestConflictError(RuntimeError):
@@ -45,6 +53,7 @@ class RunStatus(str, Enum):
     RUNNING = "running"
     INGESTED = "ingested"
     TRANSCRIBED = "transcribed"
+    SEGMENTED = "segmented"
     LOCALIZED = "localized"
     SYNTHESIZED = "synthesized"
     RENDERED = "rendered"
@@ -140,16 +149,46 @@ class RunManifest(BaseModel):
     models: dict[str, str] = Field(default_factory=dict)
     stages: dict[str, StageRecord] = Field(
         default_factory=lambda: {
-            "ingest": StageRecord(),
-            "transcribe": StageRecord(),
-            "localize": StageRecord(),
-            "synthesize": StageRecord(),
-            "render": StageRecord(),
+            name: StageRecord() for name in PIPELINE_STAGE_NAMES
         }
     )
     outputs: dict[str, str] = Field(default_factory=dict)
     timings_seconds: dict[str, float] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def ensure_pipeline_stages(self) -> "RunManifest":
+        """Add new stages without breaking manifests created by older builds."""
+        original = self.stages
+        segment_was_missing = "segment" not in original
+        migrated_segment = StageRecord()
+        if segment_was_missing and any(
+            original.get(name, StageRecord()).status != StageStatus.PENDING
+            for name in ("localize", "synthesize", "render")
+        ):
+            compatibility_outputs = {}
+            if segments_path := self.outputs.get("segments"):
+                compatibility_outputs["translation_segments"] = segments_path
+            migrated_segment = StageRecord(
+                status=StageStatus.COMPLETED,
+                completed_at=original.get("transcribe", StageRecord()).completed_at,
+                outputs=compatibility_outputs,
+            )
+            self.outputs.update(compatibility_outputs)
+
+        self.stages = {
+            name: (
+                migrated_segment
+                if name == "segment" and segment_was_missing
+                else original.get(name, StageRecord())
+            )
+            for name in PIPELINE_STAGE_NAMES
+        } | {
+            name: record
+            for name, record in original.items()
+            if name not in PIPELINE_STAGE_NAMES
+        }
+        return self
 
     @property
     def duration_ms(self) -> int:

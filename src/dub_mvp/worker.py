@@ -26,7 +26,14 @@ from dub_mvp.runner import JobRunner, LocalJobRunner, StageRequest
 
 LOGGER = logging.getLogger(__name__)
 
-STAGE_ORDER = ["ingest", "transcribe", "localize", "synthesize", "render"]
+STAGE_ORDER = [
+    "ingest",
+    "transcribe",
+    "segment",
+    "localize",
+    "synthesize",
+    "render",
+]
 MAX_LOOP_BACKOFF_SECONDS = 30.0
 DEFAULT_LEASE_SECONDS = 120
 DEFAULT_WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
@@ -70,12 +77,18 @@ def is_claimable(record: StageRecord | None, moment: datetime) -> bool:
     return False
 
 
-def find_next_queued_job(
+def advance_and_find_job(
     runs_directory: Path,
     *,
     now: datetime | None = None,
     exclude: set[Path] | None = None,
 ) -> QueuedJob | None:
+    """Advance every run's progression, then return the first claimable stage.
+
+    This writes as well as reads: queueing the next ready stage is what makes
+    progression a property of durable state rather than of whoever happens to
+    call in. The name says so.
+    """
     moment = now or datetime.now(timezone.utc)
     skipped = exclude or set()
     manifests = sorted(
@@ -220,7 +233,7 @@ def run_worker_once(
     unavailable: set[Path] = set()
 
     while True:
-        job = find_next_queued_job(runs_directory, exclude=unavailable)
+        job = advance_and_find_job(runs_directory, exclude=unavailable)
         if job is None:
             return WorkerResult(processed=False)
 

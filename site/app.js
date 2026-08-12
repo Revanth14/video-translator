@@ -114,7 +114,6 @@ async function startBackendRun() {
   form.append("video", state.file);
   form.append("language", language);
   form.append("start", "0");
-  form.append("end", "90");
   const glossary = els.glossaryInput.files[0];
   const voiceReference = els.voiceReferenceInput.files[0];
   if (glossary) form.append("glossary", glossary);
@@ -179,12 +178,13 @@ function renderJob(payload) {
   const stageStatuses = summary.stages || {};
   state.stageStatuses = stageStatuses;
   const completed = [
-    stageStatuses.ingest,
-    stageStatuses.transcribe,
-    stageStatuses.localize,
-    stageStatuses.synthesize,
-    stageStatuses.render,
-  ].filter((status) => status === "completed").length;
+    stageStatuses.ingest === "completed",
+    stageStatuses.transcribe === "completed"
+      && stageStatuses.segment === "completed",
+    stageStatuses.localize === "completed",
+    stageStatuses.synthesize === "completed",
+    stageStatuses.render === "completed",
+  ].filter(Boolean).length;
   completeStages(completed);
   setProgress(Math.max(12, completed * 20));
   els.runStatus.textContent = customerStatus(summary);
@@ -390,6 +390,7 @@ function customerStatus(summary) {
     .find(([, status]) => status === "running")?.[0];
   if (current === "ingest") return "Uploading";
   if (current === "transcribe") return "Transcribing";
+  if (current === "segment") return "Preparing speech";
   if (current === "localize") return "Translating";
   if (current === "synthesize") return "Generating voice";
   if (current === "render") return "Rendering";
@@ -400,7 +401,8 @@ function customerStatus(summary) {
     created: "Queued",
     queued: "Queued",
     ingested: "Transcribing",
-    transcribed: "Translating",
+    transcribed: "Preparing speech",
+    segmented: "Translating",
     localized: "Generating voice",
     synthesized: "Rendering",
     rendered: "Ready",

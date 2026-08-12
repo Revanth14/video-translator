@@ -302,7 +302,7 @@ def build_timestamped_segments(
     max_duration_ms: int = 12000,
     pause_split_ms: int = 700,
 ) -> list[TranscriptSegment]:
-    words = _flatten_words(transcript)
+    words = flatten_words(transcript)
     if words:
         segments = _segments_from_words(
             words,
@@ -452,9 +452,16 @@ def _segment_from_utterances(
     )
 
 
-def _flatten_words(
+def flatten_words(
     transcript: NormalizedTranscript,
 ) -> list[tuple[int, TranscriptWord]]:
+    """Index every transcript word in document order.
+
+    `TranscriptSegment.word_indexes` and `DubbingUtterance.source_word_indexes`
+    both refer to these indexes, so every consumer must use this one function.
+    A second implementation that drifted would silently point utterances at the
+    wrong words.
+    """
     indexed_words: list[tuple[int, TranscriptWord]] = []
     for utterance in transcript.utterances:
         for word in utterance.words:

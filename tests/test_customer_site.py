@@ -57,6 +57,7 @@ def test_customer_site_interaction_uses_video_upload_and_progress() -> None:
     assert 'searchParams.set("job"' in script
     assert 'form.append("glossary"' in script
     assert 'form.append("voice_reference"' in script
+    assert 'form.append("end", "90")' not in script
     assert "customerStatus" in script
     assert "setDownload" in script
     assert "startRun" in script
