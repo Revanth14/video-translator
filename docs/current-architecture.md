@@ -4,7 +4,7 @@ Describes the system as it stands. **Update this file in the same change that
 alters the architecture** — a stale architecture doc is worse than none,
 because agents and new contributors trust it.
 
-Last verified: 2026-08-12 (110 tests passing).
+Last verified: 2026-08-12 (136 tests passing, including process interruption).
 
 ## Non-negotiable invariants
 
@@ -79,6 +79,9 @@ its lease cannot publish over the worker that reclaimed the stage.
 Retries are bounded: `attempt_count` vs `max_attempts`, with exponential
 backoff via `retry_delay_seconds` (30s base, 600s cap). Every attempt is
 appended to `StageRecord.attempts`, and transitions to `StageRecord.events`.
+Translation provider/network errors are retryable; invalid translation inputs
+or responses are terminal. A permanent validation failure therefore cannot
+consume all stage attempts or spin the worker queue.
 
 ### Automatic progression
 
@@ -122,12 +125,14 @@ Run layout:
 ```text
 runs/<run_id>/
 ├── manifest.json
-├── input/          source upload, glossary.json, voice-reference.json
+├── input/          source upload, glossary.json, translation-context.json,
+│                   voice-reference.json
 ├── metadata/       ffprobe, whisperx_raw, transcript, segments,
-│                   localization_raw, localized_segments,
 │                   synthesized_segments, alignment_plan, job-queue.jsonl
 ├── utterances/     dubbing_utterances.json, translation_segments.json,
 │                   dubbing_utterances.meta.json
+├── translation/    context snapshot, revisioned aggregate + sidecar,
+│   └── batches/    request, attempts, revisioned result + sidecar per batch
 ├── working/        source_segment.mp4, source_audio.wav, dubbed_audio.wav
 ├── segments/       <segment>/tts-rN.wav  (revisioned, never overwritten)
 ├── subtitles/      hi.srt
@@ -160,7 +165,34 @@ utterances are marked explicitly, but **nothing currently produces anything but
 `NONE`** — overlap detection is not yet implemented. Overlapping input is
 rejected upstream by the transcript validators instead.
 
-Localization validates missing, duplicate, unknown, and empty segment results.
+### Translation contract
+
+`LocalizationPipeline` partitions ordered dubbing utterances into deterministic
+batches bounded by utterance count and source-character count. Each request
+owns only its batch IDs; it receives the immediately preceding and following
+source text as read-only context. Source/target language, tone, glossary,
+named entities, terminology, prompt version, provider, model, and limits all
+participate in the batch input fingerprint.
+
+Each completed batch is written and fsynced immediately, then receives a
+relative-path checksum/fingerprint sidecar. Restarting the `localize` stage
+verifies and reuses valid batches and calls the provider only for missing,
+failed, or corrupt work. Batch attempts are persisted independently; a real
+process-death test verifies resume after the first batch without repeating it.
+Forced or regenerated outputs use new revisions rather than overwriting a
+verified artifact.
+
+Provider output must return the expected batch ID, source language, target
+language, and every owned utterance exactly once in the original order. Empty,
+missing, duplicate, unknown, reordered, or wrong-language output is rejected.
+Semantic translation is deliberately separate from later duration rewriting.
+
+Translation metrics record batch reuse/regeneration, prompt version, tokens,
+provider latency, attempts, and cost. Cost is recorded only when the provider
+reports it or current per-million-token rates are explicitly configured;
+otherwise `cost_status` is `pricing_unavailable`. The aggregate fingerprint,
+provider, model, and cost are also committed to the localize `StageRecord`.
+
 Synthesis writes revisioned audio rather than overwriting.
 
 ## Web behaviour
@@ -176,8 +208,10 @@ Synthesis writes revisioned audio rather than overwriting.
 - Uploads process the **full source duration** by default; duration is derived
   from `MediaIngestor.inspect()` (ffprobe) at job creation. Trimming is an
   explicit advanced option, validated against the real duration.
-- Glossary and voice reference are persisted at job creation, before the
-  pipeline reaches the stages that need them.
+- Glossary, translation context, and voice reference are validated and
+  persisted at job creation, before the pipeline reaches the stages that need
+  them. Translation context has explicit tone, named-entity, and terminology
+  fields.
 - The browser **only submits and observes**. It never advances stages.
 - Run identity persists in `localStorage` and the `?job=<run_id>` URL, so a
   reload or a later visit restores the run. A permanently missing job (400/404)
@@ -190,6 +224,9 @@ Synthesis writes revisioned audio rather than overwriting.
   will conflict if an operator runs a stage while a worker holds a lease.
 - Overlap detection, duration-aware correction, benchmarking, and structured
   per-run event logs are not implemented yet.
+- Translation batches resume independently through verified artifacts, but
+  they remain work items inside one leased `localize` stage; they are not
+  independently scheduled across workers.
 - The web app has no upload progress reporting; a large upload is silent until
   it completes.
 - No authentication: a run id is not authorization. This is a controlled demo,
@@ -201,5 +238,9 @@ Synthesis writes revisioned audio rather than overwriting.
   (ffmpeg/ffprobe, WhisperX, OpenAI, IndicF5, torch) is undeclared and provided
   by `scripts/bootstrap-gpu.sh`. Containerization (Phase 14) must capture it.
 - Python is pinned to `>=3.10,<3.11`.
+- Translation cost estimation reads
+  `VIDEO_TRANSLATOR_OPENAI_INPUT_USD_PER_MILLION` and
+  `VIDEO_TRANSLATOR_OPENAI_OUTPUT_USD_PER_MILLION`. Rates are deliberately not
+  hard-coded because provider pricing changes.
 - Run the suite with `uv run python -m pytest` (plain `uv run pytest` may fail
   to spawn).

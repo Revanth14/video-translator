@@ -1,8 +1,10 @@
+import json
 from io import BytesIO
 from pathlib import Path
-from uuid import uuid4
 from types import SimpleNamespace
+from uuid import uuid4
 
+import pytest
 from typer.testing import CliRunner
 
 from dub_mvp.cli import app
@@ -11,6 +13,7 @@ from dub_mvp.runner import QueuedJobRunner
 from dub_mvp.upload import parse_multipart_stream
 from dub_mvp.webapp import (
     WebJobService,
+    WebAppError,
     _build_runner,
     _safe_filename,
 )
@@ -99,11 +102,35 @@ class FakeLocalizationPipeline:
         assert segments_path.is_file()
         raw = run_directory / "metadata" / "localization_raw.json"
         localized = run_directory / "metadata" / "localized_segments.json"
+        metrics = run_directory / "metadata" / "translation_metrics.json"
         raw.write_text("{}", encoding="utf-8")
         localized.write_text("[]", encoding="utf-8")
+        metrics.write_text(
+            json.dumps(
+                {
+                    "provider": "fixture",
+                    "model": "fake-translator",
+                    "prompt_version": "semantic_translation_v1",
+                    "configuration_fingerprint": "a" * 64,
+                    "batch_count": 1,
+                    "provider_calls": 1,
+                    "reused_batches": 0,
+                    "regenerated_batches": 0,
+                    "attempt_count": 1,
+                    "failed_attempts": 0,
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "provider_latency_seconds": 0.01,
+                    "cost_usd": 0.001,
+                    "cost_status": "reported",
+                }
+            ),
+            encoding="utf-8",
+        )
         return [], {
             "localization_raw": str(raw),
             "localized_segments": str(localized),
+            "translation_metrics": str(metrics),
         }, "fake-translator"
 
 
@@ -223,6 +250,10 @@ def test_web_job_service_runs_full_customer_lifecycle(tmp_path: Path) -> None:
 
     assert manifest.status == RunStatus.RENDERED
     assert manifest.stages["render"].status == StageStatus.COMPLETED
+    localize = manifest.stages["localize"]
+    assert localize.provider == "fixture"
+    assert localize.input_fingerprint == "a" * 64
+    assert localize.cost_usd == 0.001
     assert Path(manifest.outputs["dubbed_video"]).is_file()
     assert final_payload["summary"]["status"] == "rendered"
     assert final_payload["summary"]["outputs"]["dubbed_video"]
@@ -244,10 +275,37 @@ def test_web_job_service_persists_inputs_at_creation(tmp_path: Path) -> None:
     )
     input_directory = tmp_path / payload["summary"]["run_id"] / "input"
 
-    assert (input_directory / "glossary.json").read_bytes() == b'{"terms":[]}'
+    assert json.loads(
+        (input_directory / "glossary.json").read_text(encoding="utf-8")
+    ) == {"terms": []}
+    assert json.loads(
+        (input_directory / "translation-context.json").read_text(
+            encoding="utf-8"
+        )
+    )["tone"] == "natural conversational speech"
     assert b'"voice-a"' in (
         input_directory / "voice-reference.json"
     ).read_bytes()
+
+
+def test_web_job_service_rejects_invalid_translation_context_before_admission(
+    tmp_path: Path,
+) -> None:
+    service = WebJobService(
+        runs_directory=tmp_path,
+        ingestor=FakeIngestor(),
+        runner=QueuedJobRunner(),
+    )
+
+    with pytest.raises(WebAppError, match="translation context"):
+        service.create_job(
+            filename="demo.mp4",
+            source_file=staged_upload(tmp_path),
+            target_language="hi",
+            translation_context_content=b'{"tone":""}',
+        )
+
+    assert not list(tmp_path.glob("*/manifest.json"))
 
 
 def test_web_job_service_can_queue_without_local_execution(tmp_path: Path) -> None:

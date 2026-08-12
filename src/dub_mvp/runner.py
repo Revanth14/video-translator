@@ -6,9 +6,14 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from types import MappingProxyType
+from typing import Any, Mapping, Protocol
 
-from dub_mvp.localize import LocalizationError, LocalizationPipeline
+from dub_mvp.localize import (
+    LocalizationError,
+    LocalizationPipeline,
+    TranslationMetrics,
+)
 from dub_mvp.manifest import (
     Lease,
     MutationAborted,
@@ -51,8 +56,24 @@ class StageRequest:
     run_directory: Path
     stage: str
     glossary_path: Path | None = None
+    translation_context_path: Path | None = None
     voice_reference_path: Path | None = None
     lease: Lease | None = None
+
+
+@dataclass(frozen=True)
+class StageInputs:
+    source_path: str
+    source_start_ms: int
+    source_end_ms: int
+    source_language: str
+    target_language: str
+    outputs: Mapping[str, str]
+    attempt_count: int
+
+    @property
+    def duration_ms(self) -> int:
+        return self.source_end_ms - self.source_start_ms
 
 
 class JobRunner(Protocol):
@@ -115,10 +136,15 @@ class LocalJobRunner:
         )
         if manifest is None:
             return
+        inputs = _stage_inputs(manifest, request.stage)
+        del manifest
 
         started = time.monotonic()
         try:
-            outputs, models, media = self._execute(request, manifest)
+            outputs, models, media, stage_metadata = self._execute(
+                request,
+                inputs,
+            )
         except (
             JobRunnerError,
             MediaToolError,
@@ -134,8 +160,11 @@ class LocalJobRunner:
                 error=str(error),
                 lease=request.lease,
                 error_class=type(error).__name__,
-                retryable=request.lease is not None,
-                retry_delay_seconds=_retry_delay(manifest, request.stage),
+                retryable=(
+                    request.lease is not None
+                    and getattr(error, "retryable", True)
+                ),
+                retry_delay_seconds=retry_delay_seconds(inputs.attempt_count),
             )
             return
         except Exception as error:  # noqa: BLE001 - never leave a stage stuck
@@ -162,53 +191,64 @@ class LocalJobRunner:
             models=models,
             media=media,
             duration_seconds=time.monotonic() - started,
+            provider=stage_metadata.get("provider"),
+            input_fingerprint=stage_metadata.get("input_fingerprint"),
+            cost_usd=stage_metadata.get("cost_usd"),
+            record_cost="cost_usd" in stage_metadata,
         )
 
     def _execute(
         self,
         request: StageRequest,
-        manifest: RunManifest,
-    ) -> tuple[dict[str, str], dict[str, str], Any]:
+        inputs: StageInputs,
+    ) -> tuple[dict[str, str], dict[str, str], Any, dict[str, Any]]:
         if request.stage == "ingest":
             media, outputs = self.ingestor.ingest(
-                source=Path(manifest.source_path),
+                source=Path(inputs.source_path),
                 run_directory=request.run_directory,
-                start_ms=manifest.source_start_ms,
-                end_ms=manifest.source_end_ms,
+                start_ms=inputs.source_start_ms,
+                end_ms=inputs.source_end_ms,
             )
-            return outputs, {}, media
+            return outputs, {}, media, {}
         if request.stage == "transcribe":
             transcript, _, outputs = (
                 self.transcription_pipeline or TranscriptionPipeline()
             ).run(
-                audio_path=Path(_required_output(manifest, "working_audio")),
+                audio_path=Path(_required_output(inputs, "working_audio")),
                 run_directory=request.run_directory,
-                language=manifest.source_language,
-                duration_ms=manifest.duration_ms,
+                language=inputs.source_language,
+                duration_ms=inputs.duration_ms,
             )
-            return outputs, {"whisperx": transcript.model}, None
+            return outputs, {"whisperx": transcript.model}, None, {}
         if request.stage == "segment":
             _, _, outputs = (
                 self.utterance_pipeline or UtterancePipeline()
             ).run(
-                transcript_path=Path(_required_output(manifest, "transcript")),
-                segments_path=Path(_required_output(manifest, "segments")),
+                transcript_path=Path(_required_output(inputs, "transcript")),
+                segments_path=Path(_required_output(inputs, "segments")),
                 run_directory=request.run_directory,
             )
-            return outputs, {}, None
+            return outputs, {}, None, {}
         if request.stage == "localize":
-            _, outputs, model_name = (
-                self.localization_pipeline or LocalizationPipeline()
-            ).run(
+            pipeline = self.localization_pipeline or LocalizationPipeline()
+            _, outputs, model_name = pipeline.run(
                 segments_path=Path(
-                    _required_output(manifest, "translation_segments")
+                    _required_output(inputs, "translation_segments")
                 ),
                 run_directory=request.run_directory,
-                source_language=manifest.source_language,
-                target_language=manifest.target_language,
+                source_language=inputs.source_language,
+                target_language=inputs.target_language,
                 glossary_path=request.glossary_path,
+                context_path=request.translation_context_path,
             )
-            return outputs, {"translator": model_name}, None
+            metrics = TranslationMetrics.model_validate_json(
+                Path(outputs["translation_metrics"]).read_text(encoding="utf-8")
+            )
+            return outputs, {"translator": model_name}, None, {
+                "provider": metrics.provider,
+                "input_fingerprint": metrics.configuration_fingerprint,
+                "cost_usd": metrics.cost_usd,
+            }
         if request.stage == "synthesize":
             if request.voice_reference_path is None:
                 raise JobRunnerError("Voice reference is required.")
@@ -216,22 +256,22 @@ class LocalJobRunner:
                 self.synthesis_pipeline or SynthesisPipeline()
             ).run(
                 localized_segments_path=Path(
-                    _required_output(manifest, "localized_segments")
+                    _required_output(inputs, "localized_segments")
                 ),
                 run_directory=request.run_directory,
-                target_language=manifest.target_language,
+                target_language=inputs.target_language,
                 voice_reference_path=request.voice_reference_path,
             )
-            return outputs, {"tts": model_name}, None
+            return outputs, {"tts": model_name}, None, {}
         _, outputs = (self.render_pipeline or RenderPipeline()).run(
             synthesized_segments_path=Path(
-                _required_output(manifest, "synthesized_segments")
+                _required_output(inputs, "synthesized_segments")
             ),
-            source_segment_path=Path(_required_output(manifest, "source_segment")),
+            source_segment_path=Path(_required_output(inputs, "source_segment")),
             run_directory=request.run_directory,
-            duration_ms=manifest.duration_ms,
+            duration_ms=inputs.duration_ms,
         )
-        return outputs, {}, None
+        return outputs, {}, None, {}
 
 
 class QueuedJobRunner:
@@ -247,6 +287,7 @@ class QueuedJobRunner:
             run_directory=request.run_directory,
             stage=request.stage,
             glossary_path=request.glossary_path,
+            translation_context_path=request.translation_context_path,
             voice_reference_path=request.voice_reference_path,
         )
 
@@ -256,6 +297,7 @@ class QueuedJobRunner:
         run_directory: Path,
         stage: str,
         glossary_path: Path | None = None,
+        translation_context_path: Path | None = None,
         voice_reference_path: Path | None = None,
     ) -> None:
         queued_run_id: list[str] = []
@@ -292,6 +334,7 @@ class QueuedJobRunner:
             run_id=queued_run_id[0],
             stage=stage,
             glossary_path=glossary_path,
+            translation_context_path=translation_context_path,
             voice_reference_path=voice_reference_path,
         )
 
@@ -302,6 +345,7 @@ def _write_queue_event(
     run_id: str,
     stage: str,
     glossary_path: Path | None,
+    translation_context_path: Path | None,
     voice_reference_path: Path | None,
 ) -> None:
     metadata = run_directory / "metadata"
@@ -313,6 +357,9 @@ def _write_queue_event(
         "queued_at": datetime.now(timezone.utc).isoformat(),
         "run_directory": str(run_directory),
         "glossary_path": str(glossary_path) if glossary_path else None,
+        "translation_context_path": (
+            str(translation_context_path) if translation_context_path else None
+        ),
         "voice_reference_path": (
             str(voice_reference_path) if voice_reference_path else None
         ),
@@ -321,16 +368,23 @@ def _write_queue_event(
         handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
-def _required_output(manifest: RunManifest, name: str) -> str:
-    path = manifest.outputs.get(name)
+def _stage_inputs(manifest: RunManifest, stage: str) -> StageInputs:
+    record = manifest.stages.get(stage)
+    return StageInputs(
+        source_path=manifest.source_path,
+        source_start_ms=manifest.source_start_ms,
+        source_end_ms=manifest.source_end_ms,
+        source_language=manifest.source_language,
+        target_language=manifest.target_language,
+        outputs=MappingProxyType(dict(manifest.outputs)),
+        attempt_count=record.attempt_count if record else 1,
+    )
+
+
+def _required_output(inputs: StageInputs, name: str) -> str:
+    path = inputs.outputs.get(name)
     if not path:
         raise JobRunnerError(f"Required output is missing: {name}")
     if not Path(path).is_file():
         raise JobRunnerError(f"Required output file is missing: {path}")
     return path
-
-
-def _retry_delay(manifest: RunManifest, stage: str) -> float:
-    record = manifest.stages.get(stage)
-    attempt = record.attempt_count if record else 1
-    return retry_delay_seconds(attempt)

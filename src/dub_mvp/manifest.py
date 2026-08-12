@@ -439,6 +439,10 @@ def complete_stage(
     models: dict[str, str] | None = None,
     media: MediaMetadata | None = None,
     duration_seconds: float | None = None,
+    provider: str | None = None,
+    input_fingerprint: str | None = None,
+    cost_usd: float | None = None,
+    record_cost: bool = False,
     now: datetime | None = None,
 ) -> RunManifest | None:
     """Commit a successful stage. Returns None when a stale lease is fenced out."""
@@ -467,6 +471,12 @@ def complete_stage(
         if duration_seconds is not None:
             record.duration_seconds = duration_seconds
             manifest.timings_seconds[stage] = duration_seconds
+        if provider is not None:
+            record.provider = provider
+        if input_fingerprint is not None:
+            record.input_fingerprint = input_fingerprint
+        if record_cost:
+            record.cost_usd = cost_usd
         if models:
             manifest.models.update(models)
             record.model = next(iter(models.values()))

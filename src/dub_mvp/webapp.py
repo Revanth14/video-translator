@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from pydantic import ValidationError
+
+from dub_mvp.localize import Glossary, TranslationContext
 from dub_mvp.manifest import RunManifest
 from dub_mvp.media import MediaIngestor, MediaToolError, media_duration_ms
 from dub_mvp.runner import JobRunner, LocalJobRunner, QueuedJobRunner, StageRequest
@@ -29,7 +32,6 @@ MAX_UPLOAD_BYTES = int(
 
 class WebAppError(RuntimeError):
     pass
-
 
 
 class WebJobService:
@@ -90,6 +92,7 @@ class WebJobService:
         start: str = "0",
         end: str | None = None,
         glossary_content: bytes | None = None,
+        translation_context_content: bytes | None = None,
         voice_reference_content: bytes | None = None,
     ) -> dict[str, Any]:
         """Create a run from an already-uploaded file.
@@ -130,8 +133,23 @@ class WebJobService:
                     "End time exceeds the source duration "
                     f"({source_duration_ms / 1000:.3f}s)."
                 )
-            if glossary_content:
-                (input_directory / "glossary.json").write_bytes(glossary_content)
+            glossary = _validated_json_input(
+                glossary_content,
+                model=Glossary,
+                default=Glossary(),
+                label="glossary",
+            )
+            translation_context = _validated_json_input(
+                translation_context_content,
+                model=TranslationContext,
+                default=TranslationContext(),
+                label="translation context",
+            )
+            _write_model_json(input_directory / "glossary.json", glossary)
+            _write_model_json(
+                input_directory / "translation-context.json",
+                translation_context,
+            )
             voice_reference_path = input_directory / "voice-reference.json"
             if voice_reference_content:
                 voice_reference_path.write_bytes(voice_reference_content)
@@ -174,6 +192,7 @@ class WebJobService:
         run_id: str,
         stage: str,
         glossary_content: bytes | None = None,
+        translation_context_content: bytes | None = None,
         voice_reference_content: bytes | None = None,
     ) -> dict[str, Any]:
         run_directory = _safe_join(self.runs_directory, run_id)
@@ -192,7 +211,30 @@ class WebJobService:
         if glossary_content:
             glossary_path = run_directory / "input" / "glossary.json"
             glossary_path.parent.mkdir(parents=True, exist_ok=True)
-            glossary_path.write_bytes(glossary_content)
+            _write_model_json(
+                glossary_path,
+                _validated_json_input(
+                    glossary_content,
+                    model=Glossary,
+                    default=Glossary(),
+                    label="glossary",
+                ),
+            )
+
+        translation_context_path = None
+        if translation_context_content:
+            translation_context_path = (
+                run_directory / "input" / "translation-context.json"
+            )
+            _write_model_json(
+                translation_context_path,
+                _validated_json_input(
+                    translation_context_content,
+                    model=TranslationContext,
+                    default=TranslationContext(),
+                    label="translation context",
+                ),
+            )
 
         voice_reference_path = None
         if stage == "synthesize":
@@ -219,6 +261,7 @@ class WebJobService:
                 run_directory=run_directory,
                 stage=stage,
                 glossary_path=glossary_path,
+                translation_context_path=translation_context_path,
                 voice_reference_path=voice_reference_path,
             )
         )
@@ -353,6 +396,11 @@ def _handler_factory(
                         if "glossary" in parts
                         else None
                     ),
+                    translation_context_content=(
+                        parts["translation_context"].content
+                        if "translation_context" in parts
+                        else None
+                    ),
                     voice_reference_content=(
                         parts["voice_reference"].content
                         if "voice_reference" in parts
@@ -386,6 +434,11 @@ def _handler_factory(
                 stage=unquote(stage),
                 glossary_content=(
                     parts["glossary"].content if "glossary" in parts else None
+                ),
+                translation_context_content=(
+                    parts["translation_context"].content
+                    if "translation_context" in parts
+                    else None
                 ),
                 voice_reference_content=(
                     parts["voice_reference"].content
@@ -460,6 +513,30 @@ def _optional_field(
     if part is None:
         return None
     return part.content.decode("utf-8", errors="replace").strip() or None
+
+
+def _validated_json_input(
+    content: bytes | None,
+    *,
+    model: type[Any],
+    default: Any,
+    label: str,
+) -> Any:
+    if content is None:
+        return default
+    try:
+        return model.model_validate_json(content)
+    except (ValueError, ValidationError) as error:
+        raise WebAppError(f"Invalid {label}: {error}") from error
+
+
+def _write_model_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value.model_dump(mode="json"), indent=2, ensure_ascii=True)
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _safe_join(root: Path, relative: str) -> Path:

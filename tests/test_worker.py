@@ -7,6 +7,10 @@ import pytest
 from typer.testing import CliRunner
 
 from dub_mvp.cli import app
+from dub_mvp.localize import (
+    TranslationProviderError,
+    TranslationValidationError,
+)
 from dub_mvp.manifest import (
     RunManifest,
     RunStatus,
@@ -17,8 +21,7 @@ from dub_mvp.manifest import (
     renew_lease,
     retry_delay_seconds,
 )
-from dub_mvp.runner import StageRequest
-from dub_mvp.runner import QueuedJobRunner
+from dub_mvp.runner import LocalJobRunner, QueuedJobRunner, StageRequest
 from dub_mvp import worker
 from dub_mvp.worker import (
     QueuedJob,
@@ -429,6 +432,76 @@ def test_worker_once_processes_queued_stage_with_inputs(tmp_path: Path) -> None:
     assert result.stage == "synthesize"
     assert runner.stages[0].stage == "synthesize"
     assert runner.stages[0].voice_reference_path == voice_reference
+
+
+def test_transient_translation_failure_queues_bounded_stage_retry(
+    tmp_path: Path,
+) -> None:
+    class FailingPipeline:
+        def run(self, **_):
+            raise TranslationProviderError("provider timeout")
+
+    run_directory = tmp_path / "run-a"
+    manifest = write_manifest(
+        run_directory,
+        run_id="run-a",
+        queued_stage="localize",
+    )
+    segments = run_directory / "translation_segments.json"
+    segments.write_text("[]", encoding="utf-8")
+    manifest.outputs["translation_segments"] = str(segments)
+    manifest.save(run_directory)
+
+    result = run_worker_once(
+        runs_directory=tmp_path,
+        runner=LocalJobRunner(
+            localization_pipeline=FailingPipeline(),
+            background=False,
+        ),
+    )
+
+    record = RunManifest.load(run_directory).stages["localize"]
+    assert result.status == "queued"
+    assert record.status == StageStatus.QUEUED
+    assert record.error_class == "TranslationProviderError"
+    assert record.next_retry_at is not None
+    assert record.attempts[0].status == StageStatus.FAILED
+
+
+def test_invalid_translation_response_fails_terminally_without_retry(
+    tmp_path: Path,
+) -> None:
+    class InvalidPipeline:
+        def run(self, **_):
+            raise TranslationValidationError("wrong target language")
+
+    run_directory = tmp_path / "run-a"
+    manifest = write_manifest(
+        run_directory,
+        run_id="run-a",
+        queued_stage="localize",
+    )
+    segments = run_directory / "translation_segments.json"
+    segments.write_text("[]", encoding="utf-8")
+    manifest.outputs["translation_segments"] = str(segments)
+    manifest.save(run_directory)
+
+    result = run_worker_once(
+        runs_directory=tmp_path,
+        runner=LocalJobRunner(
+            localization_pipeline=InvalidPipeline(),
+            background=False,
+        ),
+    )
+
+    manifest = RunManifest.load(run_directory)
+    record = manifest.stages["localize"]
+    assert result.status == "failed"
+    assert record.status == StageStatus.FAILED
+    assert not record.retryable
+    assert record.next_retry_at is None
+    assert manifest.status == RunStatus.FAILED
+    assert advance_and_find_job(tmp_path) is None
 
 
 def test_worker_automatically_progresses_through_all_stages(

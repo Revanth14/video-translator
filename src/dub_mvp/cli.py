@@ -14,7 +14,11 @@ from dub_mvp.manifest import (
     StageRecord,
     StageStatus,
 )
-from dub_mvp.localize import LocalizationError, LocalizationPipeline
+from dub_mvp.localize import (
+    LocalizationError,
+    LocalizationPipeline,
+    localization_outputs_reusable,
+)
 from dub_mvp.media import MediaIngestor, MediaToolError, media_duration_ms
 from dub_mvp.preflight import build_preflight_report, report_to_json
 from dub_mvp.render import RenderError, RenderPipeline
@@ -317,6 +321,16 @@ def localize(
         resolve_path=True,
         help="Optional JSON glossary for technical terms.",
     ),
+    context: Path | None = typer.Option(
+        None,
+        "--context",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Optional JSON tone, named-entity, and terminology context.",
+    ),
     model: str = typer.Option(
         "gpt-5-mini",
         help="Translator model name to record and load.",
@@ -333,7 +347,19 @@ def localize(
     if (
         not force
         and stage.status == StageStatus.COMPLETED
-        and _localize_outputs_exist(stage.outputs)
+        and localization_outputs_reusable(
+            outputs=stage.outputs,
+            segments_path=Path(
+                manifest.outputs.get("translation_segments")
+                or manifest.outputs.get("segments", "")
+            ),
+            run_directory=run,
+            source_language=manifest.source_language,
+            target_language=manifest.target_language,
+            model_name=model,
+            glossary_path=glossary,
+            context_path=context,
+        )
     ):
         typer.echo(f"Localize already complete: {run}")
         typer.echo(json.dumps(manifest.public_summary(), indent=2))
@@ -363,6 +389,8 @@ def localize(
             source_language=manifest.source_language,
             target_language=manifest.target_language,
             glossary_path=glossary,
+            context_path=context,
+            reuse_completed_batches=not force,
         )
     except LocalizationError as error:
         message = str(error)
@@ -781,13 +809,6 @@ def _segment_outputs_exist(outputs: dict[str, str]) -> bool:
         "translation_segments",
         "dubbing_utterances_metadata",
     }
-    return required.issubset(outputs) and all(
-        Path(outputs[name]).is_file() for name in required
-    )
-
-
-def _localize_outputs_exist(outputs: dict[str, str]) -> bool:
-    required = {"localization_raw", "localized_segments"}
     return required.issubset(outputs) and all(
         Path(outputs[name]).is_file() for name in required
     )

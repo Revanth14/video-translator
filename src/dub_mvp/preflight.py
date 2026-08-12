@@ -124,6 +124,8 @@ def _run_checks(run_directory: Path) -> list[PreflightCheck]:
         "dubbing_utterances",
         "translation_segments",
         "localized_segments",
+        "localized_segments_metadata",
+        "translation_metrics",
         "synthesized_segments",
     ]
     for output_name in expected_outputs:

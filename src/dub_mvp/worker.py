@@ -491,12 +491,18 @@ class LeaseKeeper:
 def _stage_request(job: QueuedJob, lease: Lease | None = None) -> StageRequest:
     input_directory = job.run_directory / "input"
     glossary_path = input_directory / "glossary.json"
+    translation_context_path = input_directory / "translation-context.json"
     voice_reference_path = input_directory / "voice-reference.json"
     return StageRequest(
         run_directory=job.run_directory,
         stage=job.stage,
         glossary_path=(
             glossary_path if job.stage == "localize" and glossary_path.exists()
+            else None
+        ),
+        translation_context_path=(
+            translation_context_path
+            if job.stage == "localize" and translation_context_path.exists()
             else None
         ),
         voice_reference_path=(
