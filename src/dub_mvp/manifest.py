@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
+import re
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -24,6 +26,8 @@ PIPELINE_STAGE_NAMES = (
     "synthesize",
     "render",
 )
+CURRENT_MANIFEST_SCHEMA_VERSION = 2
+LOGGER = logging.getLogger(__name__)
 
 
 class ManifestConflictError(RuntimeError):
@@ -93,6 +97,23 @@ class StageEvent(BaseModel):
     detail: str | None = None
 
 
+class ResourceUsage(BaseModel):
+    wall_seconds: float = Field(ge=0)
+    cpu_user_seconds: float = Field(ge=0)
+    cpu_system_seconds: float = Field(ge=0)
+    max_rss_mb: float = Field(ge=0)
+
+
+class RunError(BaseModel):
+    at: datetime
+    stage: str | None = None
+    error_class: str
+    message: str
+    retryable: bool = False
+    terminal: bool = True
+    attempt_number: int | None = Field(default=None, ge=1)
+
+
 class StageRecord(BaseModel):
     status: StageStatus = StageStatus.PENDING
     attempt_count: int = Field(default=0, ge=0)
@@ -110,6 +131,7 @@ class StageRecord(BaseModel):
     input_fingerprint: str | None = None
     duration_seconds: float | None = Field(default=None, ge=0)
     cost_usd: float | None = Field(default=None, ge=0)
+    resources: ResourceUsage | None = None
     outputs: dict[str, str] = Field(default_factory=dict)
     error_class: str | None = None
     error: str | None = None
@@ -130,7 +152,7 @@ class MediaMetadata(BaseModel):
 
 
 class RunManifest(BaseModel):
-    schema_version: int = 1
+    schema_version: int = CURRENT_MANIFEST_SCHEMA_VERSION
     revision: int = Field(default=0, ge=0)
     run_id: str
     created_at: datetime = Field(
@@ -155,10 +177,12 @@ class RunManifest(BaseModel):
     outputs: dict[str, str] = Field(default_factory=dict)
     timings_seconds: dict[str, float] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
+    error_records: list[RunError] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def ensure_pipeline_stages(self) -> "RunManifest":
         """Add new stages without breaking manifests created by older builds."""
+        legacy_schema = self.schema_version < CURRENT_MANIFEST_SCHEMA_VERSION
         original = self.stages
         segment_was_missing = "segment" not in original
         migrated_segment = StageRecord()
@@ -188,6 +212,30 @@ class RunManifest(BaseModel):
             for name, record in original.items()
             if name not in PIPELINE_STAGE_NAMES
         }
+        if legacy_schema:
+            for record in self.stages.values():
+                if record.error:
+                    record.error = redact_sensitive_text(record.error)
+                for attempt in record.attempts:
+                    if attempt.error:
+                        attempt.error = redact_sensitive_text(attempt.error)
+                for event in record.events:
+                    if event.detail:
+                        event.detail = redact_sensitive_text(event.detail)
+            self.error_records = self.error_records or [
+                RunError(
+                    at=self.updated_at,
+                    error_class="legacy_error",
+                    message=redact_sensitive_text(message),
+                    retryable=False,
+                    terminal=self.status == RunStatus.FAILED,
+                )
+                for message in self.errors
+            ]
+            self.errors = [
+                redact_sensitive_text(message) for message in self.errors
+            ]
+            self.schema_version = CURRENT_MANIFEST_SCHEMA_VERSION
         return self
 
     @property
@@ -224,6 +272,18 @@ class RunManifest(BaseModel):
                 os.fsync(handle.fileno())
 
             os.replace(temporary_path, manifest_path)
+            try:
+                # The JSONL file is a recoverable projection; manifest.json
+                # remains authoritative if projection I/O fails after commit.
+                from dub_mvp.observability import write_run_event_log
+
+                write_run_event_log(self, run_directory)
+            except Exception as error:  # projection cannot invalidate commit
+                LOGGER.warning(
+                    "Unable to update event log for %s: %s",
+                    self.run_id,
+                    error,
+                )
         except Exception:
             self.revision = previous_revision
             self.updated_at = previous_updated_at
@@ -248,7 +308,7 @@ class RunManifest(BaseModel):
                 name: stage.status.value for name, stage in self.stages.items()
             },
             "outputs": self.outputs,
-            "errors": self.errors,
+            "errors": [redact_sensitive_text(error) for error in self.errors],
         }
 
 
@@ -320,9 +380,91 @@ def append_stage_event(
             to_status=to_status,
             worker_id=worker_id,
             lease_generation=lease_generation,
-            detail=detail,
+            detail=redact_sensitive_text(detail) if detail else None,
         )
     )
+
+
+def append_run_error(
+    manifest: RunManifest,
+    *,
+    at: datetime,
+    stage: str | None,
+    error_class: str,
+    message: str,
+    retryable: bool,
+    terminal: bool,
+    attempt_number: int | None = None,
+) -> str:
+    redacted = redact_sensitive_text(message)
+    manifest.errors.append(redacted)
+    manifest.error_records.append(
+        RunError(
+            at=at,
+            stage=stage,
+            error_class=error_class,
+            message=redacted,
+            retryable=retryable,
+            terminal=terminal,
+            attempt_number=attempt_number,
+        )
+    )
+    return redacted
+
+
+REDACTION_PLACEHOLDER = "[REDACTED]"
+
+# Credentials that identify themselves by shape, wherever they appear.
+_SELF_IDENTIFYING_SECRETS = re.compile(
+    r"\b(?:"
+    r"sk-[A-Za-z0-9_-]{8,}"          # OpenAI / Anthropic
+    r"|hf_[A-Za-z0-9]{16,}"          # Hugging Face (IndicF5, WhisperX weights)
+    r"|ghp_[A-Za-z0-9]{16,}"         # GitHub personal access token
+    r"|(?:AKIA|ASIA)[0-9A-Z]{12,}"   # AWS access key id
+    r")"
+)
+
+# scheme://user:password@host
+_URL_CREDENTIALS = re.compile(
+    r"(?i)\b([a-z][a-z0-9+.\-]*://)[^/\s:@]+:[^/\s@]+@"
+)
+
+# A named secret in prose, JSON, YAML, env assignments, or query strings.
+# The key may be quoted ("api_key":), the value may be quoted, and an auth
+# scheme may sit between them (Authorization: Bearer <token>).
+_NAMED_SECRET = re.compile(
+    r"(?i)("
+    r"['\"]?(?:api[_-]?key|access[_-]?key(?:[_-]?id)?"
+    r"|secret[_-]?access[_-]?key|authorization|auth[_-]?token"
+    r"|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token"
+    r"|token|secret|password|passwd|credentials?)\b['\"]?"
+    r"\s*(?:=>|[:=])\s*"
+    r"['\"]?"
+    # Refuse an already-redacted value before the optional scheme is
+    # considered; otherwise backtracking skips the scheme and redacts the word
+    # "Bearer" on a second pass.
+    r"(?!(?:bearer|basic|token)\s+\[REDACTED\])"
+    r"(?!\[REDACTED\])"
+    r"(?:(?:bearer|basic|token)\s+)?"
+    r")"
+    r"([^\s'\",;}\)\]]+)"
+)
+
+
+def redact_sensitive_text(value: str) -> str:
+    """Remove credentials before durable errors or logs are written.
+
+    Provider SDKs routinely put the request body in the exception text, so an
+    unredacted error reaches `manifest.json` and `events.jsonl` and is then
+    copied wherever the run goes. Over-redaction is the safe failure here:
+    losing a word from a message costs nothing, leaking a key costs a rotation.
+
+    The function is idempotent, because errors are redacted on write and again
+    when an older manifest is migrated on read.
+    """
+    redacted = _SELF_IDENTIFYING_SECRETS.sub(REDACTION_PLACEHOLDER, value)
+    redacted = _URL_CREDENTIALS.sub(rf"\1{REDACTION_PLACEHOLDER}@", redacted)
+    return _NAMED_SECRET.sub(rf"\1{REDACTION_PLACEHOLDER}", redacted)
 
 
 def stage_holds_lease(
@@ -373,6 +515,16 @@ def begin_stage(
             return
         previous_status = record.status
         record.status = StageStatus.RUNNING
+        if lease is None:
+            record.attempt_count += 1
+            record.attempts.append(
+                StageAttempt(
+                    attempt_number=record.attempt_count,
+                    status=StageStatus.RUNNING,
+                    started_at=moment,
+                    heartbeat_at=moment,
+                )
+            )
         record.started_at = moment
         record.heartbeat_at = moment
         record.completed_at = None
@@ -443,6 +595,7 @@ def complete_stage(
     input_fingerprint: str | None = None,
     cost_usd: float | None = None,
     record_cost: bool = False,
+    resources: ResourceUsage | None = None,
     now: datetime | None = None,
 ) -> RunManifest | None:
     """Commit a successful stage. Returns None when a stale lease is fenced out."""
@@ -477,6 +630,8 @@ def complete_stage(
             record.input_fingerprint = input_fingerprint
         if record_cost:
             record.cost_usd = cost_usd
+        if resources is not None:
+            record.resources = resources
         if models:
             manifest.models.update(models)
             record.model = next(iter(models.values()))
@@ -507,6 +662,8 @@ def fail_stage(
     error_class: str | None = None,
     retryable: bool = False,
     retry_delay_seconds: float = 0.0,
+    duration_seconds: float | None = None,
+    resources: ResourceUsage | None = None,
     now: datetime | None = None,
 ) -> RunManifest | None:
     """Record a stage failure, queueing a bounded retry when one is allowed."""
@@ -522,7 +679,8 @@ def fail_stage(
         record.completed_at = moment
         record.lease_expires_at = None
         record.worker_id = None
-        record.error = error
+        redacted_error = redact_sensitive_text(error)
+        record.error = redacted_error
         record.error_class = error_class
         if (
             retryable
@@ -537,13 +695,29 @@ def fail_stage(
             record.retryable = False
             record.next_retry_at = None
             manifest.status = RunStatus.FAILED
-        manifest.errors.append(error)
+        if duration_seconds is not None:
+            record.duration_seconds = duration_seconds
+            manifest.timings_seconds[stage] = duration_seconds
+        if resources is not None:
+            record.resources = resources
+        append_run_error(
+            manifest,
+            at=moment,
+            stage=stage,
+            error_class=error_class or "stage_error",
+            message=redacted_error,
+            retryable=record.status == StageStatus.QUEUED,
+            terminal=record.status == StageStatus.FAILED,
+            attempt_number=(
+                record.attempt_count if record.attempt_count > 0 else None
+            ),
+        )
         _close_current_attempt(
             record,
             StageStatus.FAILED,
             moment,
             error_class=error_class,
-            error=error,
+            error=redacted_error,
         )
         append_stage_event(
             record,
@@ -553,7 +727,7 @@ def fail_stage(
             to_status=record.status,
             worker_id=lease.worker_id if lease else None,
             lease_generation=lease.lease_generation if lease else 0,
-            detail=error,
+            detail=redacted_error,
         )
         accepted.append(manifest)
 

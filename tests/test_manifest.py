@@ -72,6 +72,42 @@ def test_old_manifest_gains_segment_stage_without_reopening_completed_work() -> 
     )
 
 
+def test_phase_8_manifest_migrates_structured_observability_fields() -> None:
+    manifest = RunManifest(
+        run_id="test-run",
+        source_path="source.mp4",
+        source_start_ms=0,
+        source_end_ms=1000,
+        status=RunStatus.FAILED,
+    )
+    payload = manifest.model_dump(mode="json")
+    payload["schema_version"] = 1
+    payload["errors"] = ["provider token=old-secret"]
+    payload["stages"]["transcribe"]["error"] = "token=stage-secret"
+    payload["stages"]["transcribe"]["events"] = [
+        {
+            "at": manifest.updated_at.isoformat(),
+            "event": "failed",
+            "detail": "api_key=event-secret",
+        }
+    ]
+    del payload["error_records"]
+    for record in payload["stages"].values():
+        record.pop("resources", None)
+
+    migrated = RunManifest.model_validate(payload)
+
+    assert migrated.schema_version == 2
+    assert migrated.error_records[0].error_class == "legacy_error"
+    assert migrated.error_records[0].terminal
+    assert "old-secret" not in migrated.errors[0]
+    assert "stage-secret" not in (migrated.stages["transcribe"].error or "")
+    assert "event-secret" not in (
+        migrated.stages["transcribe"].events[0].detail or ""
+    )
+    assert all(record.resources is None for record in migrated.stages.values())
+
+
 def test_stage_record_supports_durable_attempt_and_lease_metadata() -> None:
     manifest = RunManifest(
         run_id="test-run",

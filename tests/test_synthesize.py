@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 
 from dub_mvp.artifacts import ArtifactMetadata
 from dub_mvp.cli import app
+from dub_mvp.duration import DurationCorrectionError, DurationCorrector, DurationPolicy
 from dub_mvp.manifest import RunManifest, RunStatus, StageStatus
 from dub_mvp.synthesize import (
     SpeechAttempt,
@@ -163,6 +164,24 @@ def test_legacy_synthesized_segment_schema_is_migrated() -> None:
     )
 
     assert {segment.schema_version for segment in segments} == {1}
+
+
+def test_phase_nine_synthesized_segment_schema_remains_renderable(
+    tmp_path: Path,
+) -> None:
+    from dub_mvp.render import load_synthesized_segments
+
+    payload = json.loads(
+        (FIXTURES / "synthesized_segments_smoke.json").read_text(encoding="utf-8")
+    )
+    payload[0]["schema_version"] = 2
+    path = tmp_path / "phase-nine-synthesized.json"
+    path.write_text(json.dumps(payload[:1]), encoding="utf-8")
+
+    loaded = load_synthesized_segments(path)
+
+    assert loaded[0].schema_version == 2
+    assert loaded[0].duration_status == "legacy_unfitted"
 
 
 def test_pipeline_writes_revisioned_audio_and_metadata(tmp_path: Path) -> None:
@@ -380,6 +399,100 @@ def test_pipeline_reuses_verified_utterances_without_provider_calls(
     assert Path(first_outputs["speaker_voice_map"]) == Path(
         resumed_outputs["speaker_voice_map"]
     )
+    duration_histories = list(
+        (tmp_path / "speech" / "duration").glob("**/*.attempts.json")
+    )
+    assert all(
+        len(json.loads(path.read_text(encoding="utf-8"))) == 1
+        for path in duration_histories
+    )
+
+
+def test_pipeline_rebuilds_corrupt_duration_fit_without_repeating_raw_tts(
+    tmp_path: Path,
+) -> None:
+    localized_path = tmp_path / "localized.json"
+    localized_path.write_text(LOCALIZED.read_text(encoding="utf-8"))
+    _, outputs, _ = SynthesisPipeline(
+        provider=FixtureSpeechProvider()
+    ).run(
+        localized_segments_path=localized_path,
+        run_directory=tmp_path,
+        target_language="hi",
+        voice_reference_path=VOICE_REFERENCE,
+    )
+    synthesized = json.loads(
+        Path(outputs["synthesized_segments"]).read_text(encoding="utf-8")
+    )
+    fit_path = tmp_path / synthesized[0]["duration_correction_path"]
+    fit_path.write_text("corrupt", encoding="utf-8")
+    assert not synthesis_outputs_reusable(
+        outputs=outputs,
+        localized_segments_path=localized_path,
+        voice_reference_path=VOICE_REFERENCE,
+        run_directory=tmp_path,
+        target_language="hi",
+        provider_name="fixture-tts",
+        model_name="fixture-indicf5",
+    )
+    resumed = FixtureSpeechProvider()
+
+    regenerated, _, _ = SynthesisPipeline(provider=resumed).run(
+        localized_segments_path=localized_path,
+        run_directory=tmp_path,
+        target_language="hi",
+        voice_reference_path=VOICE_REFERENCE,
+    )
+
+    assert resumed.calls == []
+    assert Path(regenerated[0].duration_correction_path or "").name.endswith(
+        "r0002.result.json"
+    )
+
+
+def test_duration_policy_change_reuses_raw_speech_but_refits_timing(
+    tmp_path: Path,
+) -> None:
+    class UnavailableTransformer:
+        name = "policy-test-transformer"
+
+        def trim_artificial_pauses(self, *args, **kwargs):
+            raise DurationCorrectionError("unavailable")
+
+        def time_stretch(self, *args, **kwargs):
+            raise DurationCorrectionError("unavailable")
+
+    localized_path = tmp_path / "localized.json"
+    localized_path.write_text(LOCALIZED.read_text(encoding="utf-8"))
+    first_provider = FixtureSpeechProvider()
+    first, _, _ = SynthesisPipeline(provider=first_provider).run(
+        localized_segments_path=localized_path,
+        run_directory=tmp_path,
+        target_language="hi",
+        voice_reference_path=VOICE_REFERENCE,
+    )
+    resumed = FixtureSpeechProvider()
+    strict = DurationCorrector(
+        policy=DurationPolicy(
+            primary_ratio_tolerance=0.01,
+            primary_absolute_tolerance_ms=0,
+        ),
+        transformer=UnavailableTransformer(),
+    )
+
+    refitted, _, _ = SynthesisPipeline(
+        provider=resumed,
+        duration_corrector=strict,
+    ).run(
+        localized_segments_path=localized_path,
+        run_directory=tmp_path,
+        target_language="hi",
+        voice_reference_path=VOICE_REFERENCE,
+    )
+
+    assert resumed.calls == []
+    assert refitted[0].original_tts_audio_path == first[0].original_tts_audio_path
+    assert refitted[0].duration_correction_path != first[0].duration_correction_path
 
 
 def test_pipeline_retries_only_failed_utterance(tmp_path: Path) -> None:
@@ -505,7 +618,8 @@ def test_pipeline_measures_wav_instead_of_trusting_provider_duration(
         voice_reference_path=VOICE_REFERENCE,
     )
 
-    assert synthesized[0].tts_duration_ms == 1250
+    assert synthesized[0].original_tts_duration_ms == 1250
+    assert synthesized[0].tts_duration_ms != 9999
 
 
 class KillOnSecondProvider(FixtureSpeechProvider):
@@ -606,6 +720,9 @@ def test_synthesize_command_resumes_completed_stage(
     loaded = RunManifest.load(tmp_path)
     assert loaded.status == RunStatus.SYNTHESIZED
     assert loaded.stages["synthesize"].status == StageStatus.COMPLETED
+    assert loaded.stages["synthesize"].attempt_count == 1
+    assert loaded.stages["synthesize"].attempts[0].status == StageStatus.COMPLETED
+    assert loaded.stages["synthesize"].resources is not None
     assert Path(loaded.outputs["synthesized_segments"]).is_file()
 
 
@@ -651,6 +768,12 @@ def test_synthesize_command_force_creates_new_revision(
     assert first.exit_code == 0, first.output
     assert second.exit_code == 0, second.output
     assert [call["revision"] for call in provider.calls] == [1, 1, 2, 2]
+    record = RunManifest.load(tmp_path).stages["synthesize"]
+    assert record.attempt_count == 2
+    assert [attempt.status for attempt in record.attempts] == [
+        StageStatus.COMPLETED,
+        StageStatus.COMPLETED,
+    ]
 
 
 def test_synthesize_command_failure_updates_manifest(
@@ -692,6 +815,9 @@ def test_synthesize_command_failure_updates_manifest(
     assert loaded.status == RunStatus.FAILED
     assert loaded.stages["synthesize"].status == StageStatus.FAILED
     assert loaded.stages["synthesize"].error == "synthesis exploded"
+    assert loaded.stages["synthesize"].attempt_count == 1
+    assert loaded.stages["synthesize"].attempts[0].status == StageStatus.FAILED
+    assert loaded.error_records[0].error_class == "SynthesisError"
 
 
 def multi_speaker_segments(tmp_path: Path, speakers: list[str]) -> Path:

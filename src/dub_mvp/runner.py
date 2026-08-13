@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,11 +29,17 @@ from dub_mvp.manifest import (
     retry_delay_seconds,
 )
 from dub_mvp.media import MediaIngestor, MediaToolError
-from dub_mvp.render import RenderError, RenderPipeline
+from dub_mvp.observability import capture_resource_snapshot, resources_since
+from dub_mvp.render import RenderError, RenderPipeline, RenderReport
 from dub_mvp.synthesize import (
     SynthesisError,
     SynthesisMetrics,
     SynthesisPipeline,
+)
+from dub_mvp.storage import (
+    DEFAULT_MINIMUM_FREE_BYTES,
+    StorageCapacityError,
+    require_stage_capacity,
 )
 from dub_mvp.transcribe import TranscriptionError, TranscriptionPipeline
 from dub_mvp.utterances import UtteranceError, UtterancePipeline
@@ -99,6 +106,8 @@ class LocalJobRunner:
         synthesis_pipeline: Any | None = None,
         render_pipeline: Any | None = None,
         background: bool = True,
+        minimum_free_bytes: int = DEFAULT_MINIMUM_FREE_BYTES,
+        disk_free_bytes: Callable[[Path], int] | None = None,
     ) -> None:
         self.ingestor = ingestor or MediaIngestor()
         self.transcription_pipeline = transcription_pipeline
@@ -107,6 +116,8 @@ class LocalJobRunner:
         self.synthesis_pipeline = synthesis_pipeline
         self.render_pipeline = render_pipeline
         self.background = background
+        self.minimum_free_bytes = minimum_free_bytes
+        self.disk_free_bytes = disk_free_bytes
 
     def submit_ingest(self, run_directory: Path) -> None:
         self._submit(
@@ -145,10 +156,18 @@ class LocalJobRunner:
         # raise between claiming a stage and finishing it must still record an
         # outcome, or the stage sits in RUNNING with no explanation.
         started = time.monotonic()
+        resource_snapshot = capture_resource_snapshot()
         inputs: StageInputs | None = None
         try:
             inputs = _stage_inputs(manifest, request.stage)
             del manifest
+            require_stage_capacity(
+                request.run_directory,
+                stage=request.stage,
+                source_path=Path(inputs.source_path),
+                minimum_free_bytes=self.minimum_free_bytes,
+                free_bytes=self.disk_free_bytes,
+            )
             outputs, models, media, stage_metadata = self._execute(
                 request,
                 inputs,
@@ -161,6 +180,7 @@ class LocalJobRunner:
             LocalizationError,
             SynthesisError,
             RenderError,
+            StorageCapacityError,
         ) as error:
             fail_stage(
                 request.run_directory,
@@ -175,6 +195,8 @@ class LocalJobRunner:
                 retry_delay_seconds=retry_delay_seconds(
                     inputs.attempt_count if inputs else 1
                 ),
+                duration_seconds=time.monotonic() - started,
+                resources=resources_since(resource_snapshot),
             )
             return
         except Exception as error:  # noqa: BLE001 - never leave a stage stuck
@@ -189,6 +211,8 @@ class LocalJobRunner:
                 lease=request.lease,
                 error_class="unexpected_error",
                 retryable=False,
+                duration_seconds=time.monotonic() - started,
+                resources=resources_since(resource_snapshot),
             )
             return
 
@@ -205,6 +229,7 @@ class LocalJobRunner:
             input_fingerprint=stage_metadata.get("input_fingerprint"),
             cost_usd=stage_metadata.get("cost_usd"),
             record_cost="cost_usd" in stage_metadata,
+            resources=resources_since(resource_snapshot),
         )
 
     def _execute(
@@ -291,7 +316,16 @@ class LocalJobRunner:
             run_directory=request.run_directory,
             duration_ms=inputs.duration_ms,
         )
-        return outputs, {}, None, {}
+        stage_metadata: dict[str, Any] = {"provider": "ffmpeg"}
+        report_path = outputs.get("render_report")
+        if report_path is not None:
+            report = RenderReport.model_validate_json(
+                Path(report_path).read_text(encoding="utf-8")
+            )
+            stage_metadata["input_fingerprint"] = (
+                report.configuration_fingerprint
+            )
+        return outputs, {}, None, stage_metadata
 
 
 class QueuedJobRunner:
@@ -306,9 +340,6 @@ class QueuedJobRunner:
         self._queue(
             run_directory=request.run_directory,
             stage=request.stage,
-            glossary_path=request.glossary_path,
-            translation_context_path=request.translation_context_path,
-            voice_reference_path=request.voice_reference_path,
         )
 
     def _queue(
@@ -316,9 +347,6 @@ class QueuedJobRunner:
         *,
         run_directory: Path,
         stage: str,
-        glossary_path: Path | None = None,
-        translation_context_path: Path | None = None,
-        voice_reference_path: Path | None = None,
     ) -> None:
         queued_run_id: list[str] = []
 
@@ -353,9 +381,6 @@ class QueuedJobRunner:
             run_directory=run_directory,
             run_id=queued_run_id[0],
             stage=stage,
-            glossary_path=glossary_path,
-            translation_context_path=translation_context_path,
-            voice_reference_path=voice_reference_path,
         )
 
 
@@ -364,25 +389,17 @@ def _write_queue_event(
     run_directory: Path,
     run_id: str,
     stage: str,
-    glossary_path: Path | None,
-    translation_context_path: Path | None,
-    voice_reference_path: Path | None,
 ) -> None:
     metadata = run_directory / "metadata"
     metadata.mkdir(parents=True, exist_ok=True)
     event_path = metadata / "job-queue.jsonl"
+    # This file is a compatibility/audit hint only. The manifest and its
+    # structured event projection are authoritative; input paths are omitted
+    # because they add sensitive local detail without helping queue recovery.
     payload = {
         "run_id": run_id,
         "stage": stage,
         "queued_at": datetime.now(timezone.utc).isoformat(),
-        "run_directory": str(run_directory),
-        "glossary_path": str(glossary_path) if glossary_path else None,
-        "translation_context_path": (
-            str(translation_context_path) if translation_context_path else None
-        ),
-        "voice_reference_path": (
-            str(voice_reference_path) if voice_reference_path else None
-        ),
     }
     with event_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=True) + "\n")

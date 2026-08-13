@@ -8,6 +8,8 @@ import pytest
 from typer.testing import CliRunner
 
 from dub_mvp.cli import app
+from dub_mvp.artifacts import ArtifactMetadata, verify_artifact_integrity
+from dub_mvp.configuration import PipelineConfigurationSnapshot
 from dub_mvp.manifest import MediaMetadata, RunManifest, RunStatus, StageStatus
 from dub_mvp.runner import QueuedJobRunner
 from dub_mvp.upload import parse_multipart_stream
@@ -225,6 +227,42 @@ def test_web_job_service_creates_run_and_ingests(tmp_path: Path) -> None:
     assert manifest.stages["ingest"].status == StageStatus.COMPLETED
     assert manifest.stages["transcribe"].status == StageStatus.QUEUED
     assert Path(manifest.outputs["working_audio"]).is_file()
+    configuration_path = Path(manifest.outputs["configuration_snapshot"])
+    configuration = PipelineConfigurationSnapshot.model_validate_json(
+        configuration_path.read_text(encoding="utf-8")
+    )
+    assert configuration.source_language == "en"
+    assert configuration.target_language == "hi"
+    assert configuration.voice_catalog_sha256 is not None
+    configuration_metadata = ArtifactMetadata.model_validate_json(
+        Path(manifest.outputs["configuration_snapshot_metadata"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert verify_artifact_integrity(
+        configuration_metadata, root=run_directory
+    ).valid
+
+
+def test_web_job_rejects_language_without_passing_expansion_gate(
+    tmp_path: Path,
+) -> None:
+    service = WebJobService(
+        runs_directory=tmp_path,
+        ingestor=FakeIngestor(),
+        start_background_jobs=False,
+    )
+    upload = staged_upload(tmp_path, b"video-bytes")
+
+    with pytest.raises(WebAppError, match="not release-enabled"):
+        service.create_job(
+            filename="demo.mp4",
+            source_file=upload,
+            target_language="ta",
+        )
+
+    assert upload.is_file()
+    assert not list(path for path in tmp_path.iterdir() if path.name != ".uploads")
 
 
 def test_web_job_service_runs_full_customer_lifecycle(tmp_path: Path) -> None:

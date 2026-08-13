@@ -10,6 +10,7 @@ const state = {
 
 const jobStorageKey = "video-translator-job-id";
 let polling = false;
+const pollDelayMs = 1000;
 
 const stages = ["upload", "transcribe", "translate", "voice", "render"];
 
@@ -19,16 +20,23 @@ const els = {
   sourceVideo: document.getElementById("sourceVideo"),
   uploadPanel: document.querySelector(".source-panel"),
   uploadStatus: document.getElementById("uploadStatus"),
+  errorBanner: document.getElementById("errorBanner"),
+  errorTitle: document.getElementById("errorTitle"),
+  errorMessage: document.getElementById("errorMessage"),
   startButton: document.getElementById("startButton"),
-  retryButton: document.getElementById("retryButton"),
   resetButton: document.getElementById("resetButton"),
   progressBar: document.getElementById("progressBar"),
+  stageProgress: document.getElementById("stageProgress"),
+  utteranceProgress: document.getElementById("utteranceProgress"),
+  attemptProgress: document.getElementById("attemptProgress"),
+  progressValue: document.getElementById("progressValue"),
   runStatus: document.getElementById("runStatus"),
   resultPreview: document.getElementById("resultPreview"),
   languageSelect: document.getElementById("languageSelect"),
   glossaryInput: document.getElementById("glossaryInput"),
   voiceReferenceInput: document.getElementById("voiceReferenceInput"),
   videoDownload: document.getElementById("videoDownload"),
+  videoDownloadLabel: document.getElementById("videoDownloadLabel"),
   subtitleDownload: document.getElementById("subtitleDownload"),
   audioDownload: document.getElementById("audioDownload"),
 };
@@ -61,7 +69,6 @@ els.dropzone.addEventListener("drop", (event) => {
 });
 
 els.startButton.addEventListener("click", startRun);
-els.retryButton.addEventListener("click", retryRun);
 els.resetButton.addEventListener("click", reset);
 
 function setVideo(file) {
@@ -70,12 +77,12 @@ function setVideo(file) {
   state.objectUrl = URL.createObjectURL(file);
   els.sourceVideo.src = state.objectUrl;
   els.uploadPanel.classList.add("has-video");
+  hideError();
   els.startButton.disabled = false;
-  els.retryButton.hidden = true;
   els.uploadStatus.textContent = file.name;
   completeStages(1);
   setProgress(12);
-  els.resultPreview.innerHTML = "<span>Start translation</span>";
+  els.resultPreview.innerHTML = pendingResultMarkup();
   disableDownloads();
 }
 
@@ -91,7 +98,6 @@ function startRun() {
 function startDemoRun() {
   const language = els.languageSelect.options[els.languageSelect.selectedIndex].text;
   els.startButton.disabled = true;
-  els.retryButton.hidden = true;
   els.runStatus.textContent = "Running";
   els.runStatus.dataset.state = "running";
   els.uploadStatus.textContent = "Uploaded";
@@ -123,21 +129,25 @@ async function startBackendRun() {
     const payload = await postForm("/api/jobs", form);
     state.jobId = payload.summary.run_id;
     rememberJob(state.jobId);
-    renderJob(payload);
-    startPolling();
+    if (renderJob(payload)) startPolling();
   } catch (error) {
-    showFailure(error.message);
-    els.startButton.disabled = false;
+    showFailure(error.message, { allowResubmit: true });
   }
 }
 
 async function pollJob() {
-  if (!state.jobId || polling) return;
+  const jobId = state.jobId;
+  if (!jobId || polling) return Boolean(jobId);
   polling = true;
   try {
-    renderJob(await getJson(`/api/jobs/${encodeURIComponent(state.jobId)}`));
+    const payload = await getJson(`/api/jobs/${encodeURIComponent(jobId)}`);
+    // Reset or a newly submitted run may replace the observed job while this
+    // request is in flight. Never repaint the page with that stale response.
+    if (state.jobId !== jobId) return false;
+    return renderJob(payload);
   } catch (error) {
-    handlePollFailure(error);
+    if (state.jobId !== jobId) return false;
+    return handlePollFailure(error);
   } finally {
     polling = false;
   }
@@ -149,10 +159,12 @@ function handlePollFailure(error) {
   // is usable again instead of polling a job that will never appear.
   if (error.status === 400 || error.status === 404) {
     discardMissingJob();
-    return;
+    return false;
   }
   // Anything else is treated as transient, so polling continues.
-  els.uploadStatus.textContent = error.message;
+  els.uploadStatus.textContent = "Reconnecting";
+  showError(error.message, "Connection interrupted");
+  return true;
 }
 
 function discardMissingJob() {
@@ -166,17 +178,18 @@ function discardMissingJob() {
     ? state.file.name
     : "That job is no longer available";
   els.startButton.disabled = !state.file;
-  els.retryButton.hidden = true;
-  els.resultPreview.innerHTML = "<span>Result appears here</span>";
+  els.resultPreview.innerHTML = emptyResultMarkup();
   disableDownloads();
   setProgress(state.file ? 12 : 0);
   completeStages(state.file ? 1 : 0);
 }
 
 function renderJob(payload) {
+  hideError();
   const summary = payload.summary;
   const stageStatuses = summary.stages || {};
   state.stageStatuses = stageStatuses;
+  renderDurableProgress(summary.progress || {});
   const completed = [
     stageStatuses.ingest === "completed",
     stageStatuses.transcribe === "completed"
@@ -201,10 +214,18 @@ function renderJob(payload) {
     setDownload(els.subtitleDownload, outputs.hindi_srt, summary.run_id);
     setDownload(els.audioDownload, outputs.dubbed_audio, summary.run_id);
   }
-  if (summary.status === "failed" || summary.status === "cancelled") {
+  if (summary.status === "failed") {
     stopPolling();
     showFailure(payload.errors?.at(-1) || "Translation failed.");
-    return;
+    return false;
+  }
+  if (summary.status === "cancelled") {
+    stopPolling();
+    els.runStatus.textContent = "Cancelled";
+    els.runStatus.dataset.state = "failed";
+    els.uploadStatus.textContent = "Translation cancelled.";
+    els.startButton.disabled = true;
+    return false;
   }
   if (summary.status === "rendered") {
     stopPolling();
@@ -213,13 +234,29 @@ function renderJob(payload) {
     els.runStatus.textContent = "Ready";
     els.runStatus.dataset.state = "done";
     els.uploadStatus.textContent = "Done";
-    return;
+    return false;
   }
+  return true;
+}
+
+function renderDurableProgress(progress) {
+  const stageProgress = progress.stages || {};
+  const utterances = progress.utterances || {};
+  const attempts = progress.attempts || {};
+  els.stageProgress.textContent = (
+    `${stageProgress.completed || 0} of ${stageProgress.total || 6} `
+    + "stages complete"
+  );
+  els.utteranceProgress.textContent = (
+    `${utterances.synthesized || 0} of ${utterances.total || 0} `
+    + "utterances voiced"
+  );
+  els.attemptProgress.textContent = `${attempts.total || 0} attempts`;
 }
 
 function setRunning() {
+  hideError();
   els.startButton.disabled = true;
-  els.retryButton.hidden = true;
   els.runStatus.textContent = "Running";
   els.runStatus.dataset.state = "running";
   els.uploadStatus.textContent = state.jobId ? "Working" : "Uploading";
@@ -238,19 +275,7 @@ function finishRun(language) {
   preview.currentTime = 0;
   els.resultPreview.appendChild(preview);
   setDownload(els.videoDownload, state.objectUrl, "");
-  els.videoDownload.textContent = `${language} video`;
-}
-
-function retryRun() {
-  if (!state.file) return;
-  stopPolling();
-  state.jobId = null;
-  state.stageStatuses = {};
-  forgetJob();
-  completeStages(1);
-  setProgress(12);
-  disableDownloads();
-  startRun();
+  els.videoDownloadLabel.textContent = `${language} video`;
 }
 
 function reset() {
@@ -267,26 +292,41 @@ function reset() {
   els.sourceVideo.removeAttribute("src");
   els.sourceVideo.load();
   els.uploadPanel.classList.remove("has-video");
+  hideError();
   els.startButton.disabled = true;
-  els.retryButton.hidden = true;
   els.uploadStatus.textContent = "No file";
   els.runStatus.textContent = "Ready";
   delete els.runStatus.dataset.state;
-  els.resultPreview.innerHTML = "<span>Result appears here</span>";
+  els.resultPreview.innerHTML = emptyResultMarkup();
   disableDownloads();
   setProgress(0);
   completeStages(0);
+  renderDurableProgress({});
   drawPoster();
 }
 
 function stopPolling() {
-  if (state.poller) window.clearInterval(state.poller);
+  if (state.poller) window.clearTimeout(state.poller);
   state.poller = null;
 }
 
-function startPolling() {
+function scheduleNextPoll() {
+  if (!state.jobId || state.poller) return;
+  state.poller = window.setTimeout(async () => {
+    state.poller = null;
+    if (await pollJob()) scheduleNextPoll();
+  }, pollDelayMs);
+}
+
+function startPolling({ immediate = false } = {}) {
   stopPolling();
-  state.poller = window.setInterval(pollJob, 1000);
+  if (immediate) {
+    void (async () => {
+      if (await pollJob()) scheduleNextPoll();
+    })();
+    return;
+  }
+  scheduleNextPoll();
 }
 
 function rememberJob(runId) {
@@ -327,21 +367,34 @@ function restoreJob() {
   state.jobId = runId;
   rememberJob(runId);
   setRunning();
-  pollJob();
-  startPolling();
+  startPolling({ immediate: true });
 }
 
-function showFailure(message) {
+function showFailure(message, { allowResubmit = false } = {}) {
   els.runStatus.textContent = "Failed";
   els.runStatus.dataset.state = "failed";
-  els.uploadStatus.textContent = message;
-  els.startButton.disabled = false;
-  els.retryButton.hidden = false;
+  els.uploadStatus.textContent = allowResubmit ? "Not submitted" : "Stopped";
+  showError(message);
+  els.startButton.disabled = !(allowResubmit && state.file);
+}
+
+function showError(message, title = "Couldn’t start translation") {
+  els.errorTitle.textContent = title;
+  els.errorMessage.textContent = message;
+  els.errorBanner.hidden = false;
+}
+
+function hideError() {
+  els.errorBanner.hidden = true;
+  els.errorMessage.textContent = "";
 }
 
 function setProgress(value) {
   state.progress = value;
   els.progressBar.style.width = `${value}%`;
+  els.progressValue.textContent = `${value}%`;
+  const progress = els.progressBar.parentElement;
+  if (progress) progress.setAttribute("aria-valuenow", String(value));
 }
 
 function completeStages(count) {
@@ -357,28 +410,43 @@ function drawPoster() {
   const width = canvas.width;
   const height = canvas.height;
   context.clearRect(0, 0, width, height);
-  context.fillStyle = "#111816";
+  context.fillStyle = "#dfe9ff";
   context.fillRect(0, 0, width, height);
 
-  for (let row = 0; row < 9; row += 1) {
-    for (let col = 0; col < 14; col += 1) {
-      const x = 42 + col * 66;
-      const y = 38 + row * 54;
-      const alpha = 0.08 + ((row + col) % 4) * 0.025;
-      context.fillStyle = `rgba(255,255,255,${alpha})`;
-      context.fillRect(x, y, 44, 28);
-    }
+  for (let index = 0; index < 14; index += 1) {
+    const heightScale = 48 + ((index * 31) % 140);
+    context.fillStyle = index % 3 === 0
+      ? "rgba(102,92,220,0.18)"
+      : "rgba(42,116,238,0.14)";
+    context.fillRect(74 + index * 60, 270 - heightScale / 2, 18, heightScale);
   }
 
-  context.fillStyle = "#0b7f68";
-  context.fillRect(72, 380, 560, 12);
-  context.fillStyle = "#9db6ad";
-  context.fillRect(72, 410, 360, 12);
-  context.fillStyle = "rgba(255,255,255,0.86)";
-  context.font = "700 44px system-ui, sans-serif";
-  context.fillText("Upload video", 72, 180);
-  context.font = "500 24px system-ui, sans-serif";
-  context.fillText("Localize voice, subtitles, and timing", 72, 220);
+  context.fillStyle = "rgba(255,255,255,0.7)";
+  context.fillRect(90, 418, 780, 2);
+}
+
+function emptyResultMarkup() {
+  return `
+    <span class="empty-preview">
+      <span class="result-orb" aria-hidden="true">
+        <span></span>
+        <svg viewBox="0 0 28 28"><path d="m11 9 8 5-8 5V9Z"/></svg>
+      </span>
+      <strong>Your Hindi video will appear here</strong>
+      <small>You can leave this page. Progress is saved automatically.</small>
+    </span>`;
+}
+
+function pendingResultMarkup() {
+  return `
+    <span class="empty-preview">
+      <span class="result-orb" aria-hidden="true">
+        <span></span>
+        <svg viewBox="0 0 28 28"><path d="m11 9 8 5-8 5V9Z"/></svg>
+      </span>
+      <strong>Ready when you are</strong>
+      <small>Start translation to create the Hindi version.</small>
+    </span>`;
 }
 
 function canUseBackend() {
@@ -413,12 +481,7 @@ function customerStatus(summary) {
 
 async function getJson(url) {
   const response = await fetch(url);
-  let payload = {};
-  try {
-    payload = await response.json();
-  } catch (_error) {
-    payload = {};
-  }
+  const payload = await readJsonResponse(response);
   if (!response.ok) {
     const error = new Error(payload.error || "Request failed.");
     error.status = response.status;
@@ -432,9 +495,30 @@ async function postForm(url, form) {
     method: "POST",
     body: form,
   });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || "Request failed.");
+  const payload = await readJsonResponse(response);
+  if (!response.ok) {
+    const error = new Error(payload.error || "Request failed.");
+    error.status = response.status;
+    throw error;
+  }
   return payload;
+}
+
+async function readJsonResponse(response) {
+  try {
+    return await response.json();
+  } catch (_error) {
+    const unavailable = [404, 405, 501].includes(response.status);
+    const message = unavailable
+      ? (
+        "The translation API is unavailable on this server. "
+        + "Start it with: uv run dub-mvp web --no-open --port 8787"
+      )
+      : `The server returned an invalid response (HTTP ${response.status}).`;
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
 }
 
 function mediaUrl(path, runId) {
@@ -463,5 +547,5 @@ function disableDownloads() {
     link.removeAttribute("download");
     link.classList.add("disabled");
   });
-  els.videoDownload.textContent = "Video";
+  els.videoDownloadLabel.textContent = "Video";
 }

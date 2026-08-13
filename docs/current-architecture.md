@@ -4,7 +4,9 @@ Describes the system as it stands. **Update this file in the same change that
 alters the architecture** — a stale architecture doc is worse than none,
 because agents and new contributors trust it.
 
-Last verified: 2026-08-12 (146 tests passing, including process interruption).
+Last verified: 2026-08-13 (full suite passing, including process interruption,
+real FFmpeg duration correction, full render/decode, killed-mux recovery,
+selective retry, low-disk rejection, and release-readiness gates).
 
 ## Non-negotiable invariants
 
@@ -19,7 +21,9 @@ Last verified: 2026-08-12 (146 tests passing, including process interruption).
 ## Entry points
 
 `dub-mvp` (Typer CLI): `ingest`, `transcribe`, `segment`, `localize`,
-`synthesize`, `render`, `preflight`, `ui`, `web`, `worker`, `show`.
+`synthesize`, `render`, `benchmark`, `retry`, `release-check`,
+`language-check`, `research-check`, `preflight`, `ui`, `web`, `worker`,
+`status`, `show`.
 
 The CLI is an **operator and debugging tool**, not the creator path. Creators
 use the web app; the CLI must never become the only way to do something.
@@ -119,6 +123,85 @@ while the server kept answering requests.
 outcome through short locked mutations. It catches known pipeline errors
 (retryable under a lease) and any unexpected exception (terminal,
 `unexpected_error`), so a stage never sits in `RUNNING` with no explanation.
+Before expensive execution it measures free storage against a conservative
+stage/source-size requirement. Insufficient disk raises a visible
+`StorageCapacityError`; a leased worker treats it as transient and applies the
+same bounded retry/backoff policy, while a direct operator invocation fails
+terminally instead of starting work that cannot publish safely. Preflight
+projects the same check for queued/running stages.
+
+### Operator retry
+
+`dub-mvp retry --run <run> --utterances <ids> --from <stage>` accepts stable
+utterance IDs or their unique numeric suffixes. Supported retry boundaries are
+`localize`, `synthesize`, and `render`. Translation retry expands one selected
+utterance to its existing deterministic batch, because that batch is the
+smallest independently verifiable localization unit. Synthesis retry
+invalidates only selected raw speech/duration sidecars; unselected utterance
+proof remains completed and reusable. Aggregate synthesis, render, benchmark,
+and other genuinely downstream proof is invalidated as required.
+
+Retry is a two-phase durable transition. A locked mutation first marks the
+affected stages `INVALIDATED`, fencing the worker. Sidecars are changed from
+`completed` to `invalid` without deleting output bytes. A verified
+`metadata/retries/retry-<id>.json` audit artifact then records the decision,
+and a second locked mutation queues the earliest stage while returning later
+stages to `PENDING`. Attempt history is preserved and the explicit operator
+action grants three additional bounded attempts. Active `RUNNING` work is
+rejected without changing the manifest.
+
+### Status and observability
+
+`observability.build_run_status()` is the shared status contract. Both
+`dub-mvp status <run>` (with `show` retained as an alias) and the customer job
+API serialize that model, so stage state, attempts, progress, configuration,
+timings, resources, cost, structured errors, and recent events cannot drift
+between operator and creator views.
+
+Manifest schema version 2 adds per-stage resource usage and structured
+`RunError` records. Phase 8 manifests migrate on load: legacy error strings are
+redacted and represented as `legacy_error`; absent resource measurements stay
+unknown rather than being fabricated. Direct CLI stage execution and leased
+worker execution both record attempt/event history, wall time, process CPU
+deltas, and peak process RSS. Resource figures are process-level measurements,
+not GPU telemetry or per-child accounting; that deeper benchmark data belongs
+to Phase 12.
+
+Translation-batch, speech-utterance, and duration-fit attempt files are
+projected into the same status document, including failures, provider/model,
+latency, and reported cost. Unreadable histories surface explicitly instead of
+disappearing. Duration metrics add the primary/hard tolerance rates, unresolved
+count, rewrite/review count, measured next-cue overruns, and the automated
+timing-gate result. Render validation derives missing/duplicate utterance IDs
+and the overlap count from the plan actually rendered instead of asserting
+them, so the benchmark's drift gate tests measurements rather than constants.
+`redact_sensitive_text` runs before any durable structured error or event
+detail is written. It covers self-identifying key shapes (`sk-`, `hf_`, `ghp_`,
+`AKIA`/`ASIA`), URL basic-auth credentials, and named secrets in prose, JSON,
+YAML, env assignments, and query strings — including the quoted JSON form
+(`{"api_key": "..."}`) that provider SDKs echo back inside exception text,
+which is the most likely way a key would reach `manifest.json`. It is
+idempotent, because errors are redacted on write and again when an older
+manifest is migrated on read. Over-redaction is the intended failure mode.
+
+Every successful manifest commit atomically regenerates
+`events/run-events.jsonl`, an ordered structured projection of the authoritative
+stage events. If that projection is missing, corrupt, or stale, a status read
+rebuilds it from `manifest.json`. A real multi-process test verifies concurrent
+manifest writers leave one valid complete projection.
+
+Phase 12 benchmark paths are published into the manifest after the report and
+sidecars are durable. Publishing identical paths aborts the mutation, so
+re-reading a benchmark does not churn the manifest revision. Status exposes
+the latest render-validation and benchmark release-gate result.
+
+`release-check` independently verifies the benchmark JSON's completed status,
+size, and checksum before trusting its embedded release result. Local release
+passes only with `release_gate_status=passed`. AWS readiness additionally
+requires a verified configuration snapshot and reports each absent remote
+capability as `blocked`; a local benchmark cannot be mistaken for S3,
+conditional remote state, incremental upload, a qualified GPU runtime, or
+measured cloud cost.
 
 ## Artifacts
 
@@ -127,20 +210,24 @@ Run layout:
 ```text
 runs/<run_id>/
 ├── manifest.json
+├── events/         run-events.jsonl (recoverable manifest projection)
 ├── input/          source upload, glossary.json, translation-context.json,
-│                   voice-reference.json
+│                   voice-reference.json, pipeline-config.json + sidecar
 ├── metadata/       ffprobe, whisperx_raw, transcript, segments,
-│                   alignment_plan, job-queue.jsonl
+│   └── retries/    verified operator-retry decisions
 ├── utterances/     dubbing_utterances.json, translation_segments.json,
 │                   dubbing_utterances.meta.json
 ├── translation/    context snapshot, revisioned aggregate + sidecar,
 │   └── batches/    request, attempts, revisioned result + sidecar per batch
 ├── speech/         revisioned aggregate, metrics, run record + sidecars,
 │   ├── voice-maps/ persisted speaker map + sidecar
-│   └── utterances/ attempts, revisioned WAV/result + sidecars per utterance
-├── working/        source_segment.mp4, source_audio.wav, dubbed_audio.wav
-├── subtitles/      hi.srt
-└── outputs/        dubbed_video.mp4
+│   ├── utterances/ raw TTS attempts, revisioned WAV/result + sidecars
+│   └── duration/   bounded fit attempts, candidates, results + sidecars
+├── render/         command attempts, validated report + sidecars
+├── benchmark/      JSON/Markdown report, review template + sidecars
+├── working/        source_segment.mp4, source_audio.wav, revisioned dub WAV
+├── subtitles/      revisioned Hindi SRT
+└── outputs/        revisioned dubbed MP4
 ```
 
 `artifacts.py` defines the reuse contract. An artifact is reusable only when
@@ -150,6 +237,27 @@ directory** so a run survives being moved, copied, or uploaded to S3.
 
 `fingerprint_inputs` canonicalizes JSON (sorted keys) and rejects bare
 datetimes — a timestamp in a fingerprint means nothing is ever reusable again.
+
+Changing a sidecar to `invalid` is the explicit operator-retry mechanism. It
+is not file deletion: prior payloads remain inspectable, while every reuse
+path rejects the invalid proof and writes a new revision.
+
+### Configuration and expansion gates
+
+Every admitted web job and CLI ingest snapshots the configured language pair,
+translation/TTS provider and model identities, voice/glossary/context paths and
+checksums, and duration/render policy fingerprints into verified
+`input/pipeline-config.json`. The release registry currently admits only
+`en→hi`; the HTTP API and ingest CLI reject other pairs before durable work is
+queued.
+
+`language-check` does not enable a language. It verifies that the Hindi
+baseline has a checksum-valid passing benchmark and that the candidate has a
+source/target-aligned evaluation set with unique stable items. A separate
+reviewed registry change is still required. `research-check` similarly parses
+the explicit baseline X, measured bottleneck Y, objective Z, expected
+improvement W, evaluation method E contract and requires its evaluation-set
+file to exist; it does not start training.
 
 ## Media contracts
 
@@ -238,13 +346,128 @@ attempts, failures, latency, voice-map/configuration fingerprint, and measured
 generated duration. The provider and fingerprint are committed to the
 `synthesize` stage record.
 
-The aggregate `SynthesizedSegment` schema is version 2 (speaker, voice, and
-speech-artifact provenance). The loader migrates unversioned Phase 0–6
-aggregates as version 1 with optional provenance fields, so in-flight runs can
-still reach render.
+### Duration-correction contract
+
+Duration correction is part of `synthesize`, after immutable raw TTS and before
+the synthesized aggregate is committed. It is deliberately not another stage:
+the corrector needs the existing utterance, assigned voice, raw speech sidecar,
+and provider capability, and verified raw speech remains reusable when a fit is
+interrupted or its policy changes.
+
+For every utterance the corrector measures
+`generated_duration - duration_budget` and
+`generated_duration / duration_budget`; provider-reported duration is never
+trusted. It then tries, in order: accept, an optional conservative provider
+rate/pause call, lossless leading/trailing artificial-pause trimming, bounded
+pitch-preserving FFmpeg `atempo`, an optional compact semantic rewrite,
+regeneration with the already assigned voice, a final bounded stretch, and an
+explicit unresolved result. The default does **not** add a rewriting model:
+`DurationRewriter` is injectable because project rules require benchmarking
+before adding a provider/model. Required glossary terms and the rewriter's
+meaning/term-preservation assertions are validated before regeneration, and
+every rewrite still requires human review.
+
+`DurationPolicy` fixes the primary tolerance at 10% or 250 ms, the hard limit
+at 20%, mild tempo delta at 12%, provider-control/rewrite counts, and an overall
+attempt cap. The complete policy, transformer, and optional rewriter identity
+participate in the fit and synth-stage fingerprints. Every slow tactic is
+preceded by a durable `running` attempt; a killed process leaves visible
+interrupted work, raw TTS is reused, and the correction resumes. Failures are
+redacted and recorded instead of silently skipped.
+
+Each fit result embeds the selected verified audio sidecar and points to its
+attempt history. Reuse verifies result and audio checksums/sizes, measured WAV
+duration, input fingerprint, stable utterance timing/voice, and exact attempt
+history. Corrupt correction artifacts are regenerated without repeating raw
+TTS. Aggregate duration metrics report primary/hard pass percentages,
+unresolved and human-review counts, attempts/provider calls, worst error, and
+the automated provisional gate.
+
+Source start timestamps never change, so start-time drift is zero **by
+contract**. That is a structural property and is stated as one rather than
+reported as a measured `0`, which a downstream gate would otherwise read as
+evidence. The measurable neighbour risk is corrected audio running past the
+next utterance's cue — an utterance can sit inside the hard tolerance and still
+collide, because tolerance is measured against its own window, not the gap to
+the next cue. `next_start_overrun_count` and `maximum_next_start_overrun_ms`
+measure exactly that, and any overrun fails the automated timing gate, so the
+problem surfaces before an expensive render refuses the plan.
+
+The aggregate `SynthesizedSegment` schema is version 3 and carries raw/final
+audio provenance, measured error/ratio, fit status/strategy, and review flag.
+The loader still accepts unversioned Phase 0–6 aggregates as version 1 and
+Phase 7–9 version-2 aggregates. Render retains its legacy tempo path for those
+in-flight runs. For version 3 it never applies a second hidden correction, and
+it rejects an unresolved or over-hard-limit utterance before FFmpeg composition.
+
+### Composition and render contract
+
+`RenderPolicy` makes composition explicit. `clean_replacement` is the default
+first synchronization proof: it creates a full-timeline silent bed and places
+only dubbed voices. `duck_original` keeps the original audio but reduces it to
+the configured volume inside utterance windows; this can retain source
+dialogue and must not be confused with dialogue/background separation. No
+separation model or complex-overlap mechanism has been added without benchmark
+evidence.
+
+Every utterance is resampled to the configured 48 kHz stereo floating-point
+layout, receives short edge fades, and is placed at its immutable source start.
+Legacy synthesized artifacts receive their one bounded tempo correction here;
+schema-v3 artifacts never receive a second hidden fit. Even a Phase 10
+tolerance-accepted utterance is rejected if its real effective end would cross
+the next utterance or final timeline. The full mix uses deterministic loudness
+normalization and peak limiting, is trimmed to the requested run duration, and
+is written as PCM WAV.
+
+Muxing maps the original video and dubbed audio explicitly, copies the video
+stream, encodes AAC audio, preserves source metadata, sets an explicit duration
+and fast-start flag, and deliberately does not use `-shortest`. The old command
+could truncate a video at the last utterance; the full-duration bed and explicit
+duration close that defect.
+
+Plans, subtitles, WAVs, MP4s, command histories, and the final render report are
+revisioned artifacts with relative checksum/fingerprint sidecars. A command is
+durably recorded as `running` before execution and closed afterward. After a
+process death, the interrupted command is marked failed and valid intermediates
+are found by their sidecars across revisions. Corrupt completed output is never
+overwritten: a new revision is created while other verified intermediates are
+reused.
+
+Before completion the renderer probes source, WAV, and MP4; checks duration,
+sample rate, channels, video codec/dimensions/frame rate; measures decoded peak;
+and fully decodes the output video and audio with `-xerror`. A failed input or
+validation contract is permanent; a tool execution failure remains retryable.
+The render report is itself verified and is the authoritative reuse proof.
+
+### Benchmark and human-evaluation contract
+
+`dub-mvp benchmark <run>` reads the manifest and existing verified-stage
+evidence; it never reruns a provider. Its revisioned JSON and Markdown reports
+aggregate input media, ASR confidence and real-time factor, translation
+tokens/retries/cost, synthesis runtime/reuse, median/p95 timing error, render
+validation, per-stage attempts/resources/cost, storage, stable-ID integrity,
+and speaker/voice consistency. A compact human-review template selects the
+beginning/middle/end, every speaker, fast/slow speech, and available evidence
+for names, terminology, rewrites, and low-confidence ASR. Reviewers explicitly
+declare whether noise, music, or overlap is present and must cover those tags
+when applicable.
+
+Automated gates use `passed`, `failed`, `not_measured`, or `not_applicable`.
+Unavailable GPU time/VRAM/cost and absent human scores remain `not_measured`,
+never zero. A short fixture fails the 30–45 minute scope gate. Critical defects
+remain separate from median scores, and critical mistranslation/name/omission
+categories fail their own gate. Report reuse excludes benchmark output paths
+from its fingerprint, so publishing a report does not invalidate itself;
+changed stage evidence, artifacts, configuration, or human review does.
 
 ## Web behaviour
 
+- The customer surface uses a responsive, content-first glass layout with
+  translucent functional controls, high-contrast media surfaces, reduced-motion
+  support, and a solid fallback when `backdrop-filter` is unavailable. Visual
+  styling does not own progress or orchestration state. The visible language
+  selector exposes only the release-enabled English→Hindi pair; unsupported
+  candidates cannot be submitted from the product UI.
 - Uploads **stream to disk** (`upload.py`, `parse_multipart_stream`). The video
   part is written to `runs/.uploads/<uuid>.upload` as it arrives and moved into
   the run; every other field is buffered under `MAX_FIELD_BYTES`. Peak memory is
@@ -263,15 +486,60 @@ still reach render.
 - The browser **only submits and observes**. It never advances stages.
 - Run identity persists in `localStorage` and the `?job=<run_id>` URL, so a
   reload or a later visit restores the run. A permanently missing job (400/404)
-  releases the stored id; transient errors keep polling.
+  releases the stored id; transient errors keep polling. An explicit URL id
+  wins over stale local storage, and clearing the view preserves unrelated
+  query parameters.
+- Status polling uses one recursive timeout, scheduled only after the previous
+  request completes. Rendered, failed, and cancelled runs do not schedule
+  another request, including immediately after restoration. A response for a
+  run cleared or replaced while its request was in flight is ignored.
+- API responses are parsed through one guarded JSON boundary. A static server,
+  proxy, or other endpoint returning HTML cannot leak a raw `Response.json()`
+  exception into the interface; the selected file remains available and the
+  page shows the correct `dub-mvp web` startup command.
+- Creator retry is intentionally absent: a restored browser no longer owns the
+  upload `File`, and retries must not become client-side stage orchestration.
+  The stage endpoint remains an operator/debugging surface only; durable
+  recovery is the server-side `dub-mvp retry` command.
 
 ## Known gaps
 
 - `cli.py` still holds a manifest across pipeline execution (the pattern fixed
   in `runner.py`). Safe only because nothing else writes during a CLI run; it
   will conflict if an operator runs a stage while a worker holds a lease.
-- Overlap detection, duration-aware correction, benchmarking, and structured
-  per-run event logs are not implemented yet.
+- Overlap detection is not implemented yet.
+- The Phase 10 correction mechanism and provisional automated thresholds are
+  implemented, but the 30–45 minute benchmark and human semantic review have
+  not run. The optional compact-rewrite provider is intentionally unconfigured
+  until that benchmark demonstrates it is needed and identifies a suitable
+  model. Consequently, severe real-provider output can be surfaced as
+  `unresolved` and will block render rather than being hidden.
+- The Phase 12 aggregator is implemented, but this repository has not been
+  given a real 30–45 minute provider run or completed human-review submission.
+  GPU time, utilization/VRAM, and GPU/storage pricing are not instrumented, so
+  the complete-reporting and release gates honestly remain `not_measured`.
+- Phase 13 recovery mechanisms are implemented and covered for corruption,
+  missing proof, lease fencing/reclamation, competing workers, bounded
+  provider retries, supervisor faults, low disk, and real process death in
+  localization, synthesis, duration fitting, and rendering. A real provider
+  run is still required to exercise provider-specific timeout/rate-limit
+  behavior and every major-stage kill scenario at long-form scale.
+- Phase 14 is deliberately not complete. `Dockerfile` packages the core
+  executor and FFmpeg, but it is not a qualified GPU image and does not install
+  the undeclared WhisperX/OpenAI/IndicF5/torch runtime. There is no S3 artifact
+  backend, remote conditional state/fencing implementation, incremental
+  upload, AWS Batch resource, Spot-interruption proof, or measured cloud cost.
+  `release-check --target aws` makes each absence an explicit blocker.
+- Phase 15 is deliberately not complete. English→Hindi is the only admitted
+  pair; no second language/provider/model or trained component has been added.
+  Readiness contracts prevent expansion without a passing Hindi benchmark,
+  candidate evaluation set, and explicit research evidence.
+- Clean replacement and original-track ducking are implemented. Dialogue/
+  background separation and complex overlap composition remain deliberately
+  unimplemented until benchmark evidence justifies a model and its cost.
+- Resource tracking currently covers process CPU, wall time, and peak RSS; it
+  does not yet measure GPU utilization/VRAM or attribute child-process resource
+  use precisely.
 - Translation batches resume independently through verified artifacts, but
   they remain work items inside one leased `localize` stage; they are not
   independently scheduled across workers.
@@ -282,9 +550,11 @@ still reach render.
 
 ## Environment
 
-- `pyproject.toml` declares only `pydantic` and `typer`. The real runtime
-  (ffmpeg/ffprobe, WhisperX, OpenAI, IndicF5, torch) is undeclared and provided
-  by `scripts/bootstrap-gpu.sh`. Containerization (Phase 14) must capture it.
+- `pyproject.toml` declares only `pydantic` and `typer`. The real GPU runtime
+  (WhisperX, OpenAI, IndicF5, torch) is undeclared and provided by
+  `scripts/bootstrap-gpu.sh`. The current container intentionally captures the
+  core executor and FFmpeg only; benchmark-selected GPU dependencies remain an
+  AWS-readiness blocker.
 - Python is pinned to `>=3.10,<3.11`.
 - Translation cost estimation reads
   `VIDEO_TRANSLATOR_OPENAI_INPUT_USD_PER_MILLION` and
@@ -292,3 +562,7 @@ still reach render.
   hard-coded because provider pricing changes.
 - Run the suite with `uv run python -m pytest` (plain `uv run pytest` may fail
   to spawn).
+- Node.js is a **test-only** prerequisite: it runs `site/app.js` in the browser
+  behaviour harness, the only executable coverage of the frontend. Without it
+  those scenarios skip and the suite still reports success, so CI should set
+  `VIDEO_TRANSLATOR_REQUIRE_NODE=1` to turn the skip into a failure.

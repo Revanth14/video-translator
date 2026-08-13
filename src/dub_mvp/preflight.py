@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from dub_mvp.manifest import RunManifest
 from dub_mvp.synthesize import SynthesisError, load_voice_catalog
+from dub_mvp.storage import measure_stage_capacity
 
 
 class PreflightCheck(BaseModel):
@@ -117,6 +118,34 @@ def _run_checks(run_directory: Path) -> list[PreflightCheck]:
             detail=f"Loaded run {manifest.run_id}.",
         )
     )
+    for stage_name, record in manifest.stages.items():
+        if record.status.value not in {"queued", "running"}:
+            continue
+        try:
+            capacity = measure_stage_capacity(
+                run_directory,
+                stage=stage_name,
+                source_path=Path(manifest.source_path),
+            )
+        except (OSError, ValueError) as error:
+            checks.append(
+                PreflightCheck(
+                    name=f"run:disk:{stage_name}",
+                    status="fail",
+                    detail=f"Unable to measure disk capacity: {error}",
+                )
+            )
+            continue
+        checks.append(
+            PreflightCheck(
+                name=f"run:disk:{stage_name}",
+                status="pass" if capacity.sufficient else "fail",
+                detail=(
+                    f"{capacity.free_bytes} bytes free; "
+                    f"{capacity.required_bytes} bytes required."
+                ),
+            )
+        )
     expected_outputs = [
         "source_segment",
         "working_audio",

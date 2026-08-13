@@ -37,6 +37,117 @@ Run continuously:
 uv run dub-mvp worker --runs runs --poll-seconds 5
 ```
 
+## Run Status
+
+Inspect the same durable status document used by the web app:
+
+```bash
+uv run dub-mvp status runs/<run-id>
+```
+
+It includes stage and work-item attempts, utterance progress, timings,
+resources, reported cost, structured errors, and recent events.
+
+## Duration Correction
+
+Synthesis now measures every generated WAV and applies a bounded,
+least-damaging duration policy before render. Raw TTS remains immutable and
+reusable; correction attempts and verified outputs live under
+`speech/duration/`. Unresolved timing violations are visible in status and are
+rejected before render instead of receiving an unrecorded tempo adjustment.
+
+Compact semantic rewriting is an injectable capability, not a silently added
+provider. Benchmark and human review remain required before enabling one in a
+production configuration.
+
+## Rendering
+
+Rendering creates a full-duration 48 kHz stereo audio bed, normalizes
+loudness, limits peaks, preserves source-timeline silence, copies the video
+stream, and validates the final MP4 with FFprobe plus a full FFmpeg decode.
+Clean speech replacement is the default. Original-track ducking is explicit:
+
+```bash
+uv run dub-mvp render runs/<run-id> --composition duck_original
+```
+
+Every plan, subtitle, command history, WAV, MP4, and render report is
+revisioned and checksum verified. Interrupted rendering reuses verified
+intermediates.
+
+## Benchmark
+
+Aggregate the run's durable evidence without rerunning providers:
+
+```bash
+uv run dub-mvp benchmark runs/<run-id>
+```
+
+This writes `benchmark/*.json`, `benchmark/*.md`, and a human-review template.
+After filling that template, include it with:
+
+```bash
+uv run dub-mvp benchmark runs/<run-id> --human-review review.json
+```
+
+Missing GPU, pricing, long-form, or human evidence is reported as
+`not_measured`; it is never converted to zero or a release pass.
+
+## Operator Recovery
+
+Retry only selected stable utterance IDs and the artifacts downstream of them:
+
+```bash
+uv run dub-mvp retry \
+  --run runs/<run-id> \
+  --utterances 18,19,20 \
+  --from synthesize
+```
+
+The command invalidates proof sidecars rather than deleting prior outputs,
+preserves attempt history, records a verified retry report, and queues the
+earliest affected stage. It refuses to invalidate active leased work.
+
+## Release Readiness
+
+Require a verified passing benchmark before treating a local run as releasable:
+
+```bash
+uv run dub-mvp release-check --run runs/<run-id> --target local
+```
+
+`--target aws` currently exits nonzero. The same worker executor has a core
+container definition, but GPU/provider dependencies, remote conditional state,
+S3 artifact transfer, interruption proof, and measured cloud cost are
+deliberately blocked until a real long-form benchmark passes.
+
+Language and training expansion are also evidence-gated:
+
+```bash
+uv run dub-mvp language-check \
+  --run runs/<passing-hindi-run> \
+  --candidate ta \
+  --evaluation-set evaluation/ta.json
+
+uv run dub-mvp research-check --decision research/decision.json
+```
+
+The admitted product language pair remains English → Hindi. A readiness pass
+is evidence to make a separate reviewed registry change; it does not silently
+enable a new language or train a model.
+
+## Worker Container
+
+The current container packages the core worker loop and FFmpeg runtime:
+
+```bash
+docker build -t dub-mvp-worker .
+docker run --rm -v "$PWD/runs:/runs" dub-mvp-worker
+```
+
+It is not yet a benchmark-qualified GPU image and should not be represented as
+an AWS deployment.
+
 ## Deployment
 
 - Copy `.env.example` to `.env` and fill provider credentials.

@@ -11,9 +11,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from pydantic import BaseModel, Field
-
 from dub_mvp.manifest import RunManifest
+from dub_mvp.observability import build_run_status
 
 
 class UiError(RuntimeError):
@@ -45,35 +44,11 @@ class UiServer:
         self._server.serve_forever()
 
 
-class CustomerRunSummary(BaseModel):
-    run_id: str
-    status: str
-    source: str
-    range_ms: list[int]
-    target_language: str
-    updated_at: str
-    stages: dict[str, str]
-    outputs: dict[str, str]
-    metrics: dict[str, Any] = Field(default_factory=dict)
-
-
 def build_customer_run_payload(run_directory: Path) -> dict[str, Any]:
     manifest = RunManifest.load(run_directory)
-    summary = CustomerRunSummary(
-        run_id=manifest.run_id,
-        status=manifest.status.value,
-        source=manifest.source_path,
-        range_ms=[manifest.source_start_ms, manifest.source_end_ms],
-        target_language=manifest.target_language,
-        updated_at=manifest.updated_at.isoformat(),
-        stages={
-            name: stage.status.value for name, stage in manifest.stages.items()
-        },
-        outputs=manifest.outputs,
-        metrics=_run_metrics(manifest, run_directory),
-    )
+    summary = build_run_status(run_directory).model_dump(mode="json")
     return {
-        "summary": summary.model_dump(mode="json"),
+        "summary": summary,
         "segments": _read_json_output(
             manifest.outputs.get("localized_segments")
             or manifest.outputs.get("translation_segments")
@@ -85,7 +60,7 @@ def build_customer_run_payload(run_directory: Path) -> dict[str, Any]:
         "alignment_plan": _read_json_output(
             manifest.outputs.get("alignment_plan")
         ),
-        "errors": manifest.errors,
+        "errors": [error["message"] for error in summary["errors"]],
     }
 
 
@@ -277,43 +252,6 @@ def _safe_join(root: Path, relative: str) -> Path:
     return path
 
 
-def _run_metrics(
-    manifest: RunManifest,
-    run_directory: Path,
-) -> dict[str, Any]:
-    segments = _as_list(
-        _read_json_output(
-            manifest.outputs.get("translation_segments")
-            or manifest.outputs.get("segments")
-        )
-    )
-    localized = _as_list(
-        _read_json_output(manifest.outputs.get("localized_segments"))
-    )
-    synthesized = _as_list(
-        _read_json_output(manifest.outputs.get("synthesized_segments"))
-    )
-    alignment = _read_json_output(manifest.outputs.get("alignment_plan"))
-    needs_review = 0
-    if isinstance(alignment, dict):
-        needs_review = sum(
-            1 for item in alignment.get("segments", [])
-            if isinstance(item, dict) and item.get("needs_review")
-        )
-    return {
-        "segments": len(segments),
-        "localized": len(localized),
-        "synthesized": len(synthesized),
-        "needs_review": needs_review,
-        "duration": _duration_label(manifest.duration_ms),
-        "has_video": _relative_media(
-            run_directory,
-            manifest.outputs.get("dubbed_video"),
-        )
-        is not None,
-    }
-
-
 def _read_json_output(path: str | None) -> Any:
     if not path:
         return None
@@ -324,16 +262,6 @@ def _read_json_output(path: str | None) -> Any:
         return json.loads(output_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-
-
-def _as_list(value: Any) -> list[Any]:
-    return value if isinstance(value, list) else []
-
-
-def _duration_label(milliseconds: int) -> str:
-    total_seconds = max(0, milliseconds // 1000)
-    minutes, seconds = divmod(total_seconds, 60)
-    return f"{minutes}:{seconds:02d}"
 
 
 def _relative_media(run_directory: Path, path: str | None) -> str | None:
@@ -715,8 +643,8 @@ HTML = r"""<!doctype html>
       document.getElementById("title").textContent = summary.run_id;
       document.getElementById("subtitle").textContent = `${summary.status} - ${summary.metrics.duration} - ${summary.target_language.toUpperCase()}`;
       renderVideo(summary, runId);
-      renderStages(summary.stages);
-      renderMetrics(summary.metrics);
+      renderStages(summary.stages, summary.stage_details || {});
+      renderMetrics(summary.metrics, summary.progress || {});
       renderDownloads(summary, runId);
       renderSegments(payload, runId);
     }
@@ -731,24 +659,27 @@ HTML = r"""<!doctype html>
       }
     }
 
-    function renderStages(stages) {
+    function renderStages(stages, details) {
       const box = document.getElementById("stages");
       box.innerHTML = "";
       Object.entries(stageLabels).forEach(([key, label]) => {
         const status = stages[key] || "pending";
         const row = document.createElement("div");
         row.className = "stage";
-        row.innerHTML = `<span>${label}</span><span class="pill ${status}">${status}</span>`;
+        const attempts = details[key]?.attempt_count || 0;
+        const attemptLabel = attempts ? ` · ${attempts} attempt${attempts === 1 ? "" : "s"}` : "";
+        row.innerHTML = `<span>${label}${attemptLabel}</span><span class="pill ${status}">${status}</span>`;
         box.appendChild(row);
       });
     }
 
-    function renderMetrics(metrics) {
+    function renderMetrics(metrics, progress) {
       document.getElementById("metrics").innerHTML = [
         ["Segments", metrics.segments || 0],
         ["Localized", metrics.localized || 0],
         ["Voiced", metrics.synthesized || 0],
         ["Review", metrics.needs_review || 0],
+        ["Attempts", progress.attempts?.total || 0],
       ].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
     }
 
@@ -772,7 +703,10 @@ HTML = r"""<!doctype html>
     function renderSegments(payload, runId) {
       const segments = Array.isArray(payload.segments) ? payload.segments : [];
       const synth = new Map((payload.synthesized_segments || []).map(item => [item.segment_id, item]));
-      const review = new Set(((payload.alignment_plan || {}).segments || []).filter(item => item.needs_review).map(item => item.segment_id));
+      const review = new Set([
+        ...((payload.alignment_plan || {}).segments || []).filter(item => item.needs_review).map(item => item.segment_id),
+        ...(payload.synthesized_segments || []).filter(item => item.requires_timing_review).map(item => item.segment_id),
+      ]);
       if (!segments.length) {
         document.getElementById("segments").innerHTML = "<div class='empty'>Segments appear after transcription.</div>";
         return;

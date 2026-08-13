@@ -2,26 +2,60 @@ from __future__ import annotations
 
 import json
 import re
-import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
 
+from dub_mvp.benchmark import BenchmarkError, build_benchmark
+from dub_mvp.configuration import (
+    ConfigurationError,
+    build_configuration_snapshot,
+    validate_release_language_pair,
+    write_configuration_snapshot,
+)
 from dub_mvp.manifest import (
     RunManifest,
     RunStatus,
+    StageAttempt,
     StageRecord,
     StageStatus,
+    append_run_error,
+    append_stage_event,
+    redact_sensitive_text,
 )
 from dub_mvp.localize import (
     LocalizationError,
     LocalizationPipeline,
+    TranslationMetrics,
     localization_outputs_reusable,
 )
 from dub_mvp.media import MediaIngestor, MediaToolError, media_duration_ms
+from dub_mvp.observability import (
+    ResourceSnapshot,
+    build_run_status,
+    capture_resource_snapshot,
+    resources_since,
+)
 from dub_mvp.preflight import build_preflight_report, report_to_json
-from dub_mvp.render import RenderError, RenderPipeline
+from dub_mvp.readiness import (
+    DeploymentTarget,
+    ReadinessStatus,
+    assess_deployment_readiness,
+    assess_language_expansion,
+    assess_research_readiness,
+    readiness_json,
+)
+from dub_mvp.render import (
+    CompositionMode,
+    RenderError,
+    RenderPipeline,
+    RenderPolicy,
+    RenderReport,
+    render_outputs_reusable,
+)
+from dub_mvp.retry import RetryError, RetryStage, retry_run
 from dub_mvp.synthesize import (
     SynthesisError,
     SynthesisMetrics,
@@ -39,6 +73,129 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Build and inspect resumable video dubbing runs.",
 )
+
+
+@dataclass(frozen=True)
+class CliStageMeasurement:
+    started_at: datetime
+    resources: ResourceSnapshot
+
+
+def _start_cli_stage(
+    manifest: RunManifest,
+    stage_name: str,
+) -> CliStageMeasurement:
+    moment = datetime.now(timezone.utc)
+    record = manifest.stages.setdefault(stage_name, StageRecord())
+    previous_status = record.status
+    record.status = StageStatus.RUNNING
+    record.attempt_count += 1
+    record.started_at = moment
+    record.heartbeat_at = moment
+    record.completed_at = None
+    record.error = None
+    record.error_class = None
+    record.attempts.append(
+        StageAttempt(
+            attempt_number=record.attempt_count,
+            status=StageStatus.RUNNING,
+            started_at=moment,
+            heartbeat_at=moment,
+        )
+    )
+    append_stage_event(
+        record,
+        at=moment,
+        event="started",
+        from_status=previous_status,
+        to_status=StageStatus.RUNNING,
+    )
+    manifest.status = RunStatus.RUNNING
+    return CliStageMeasurement(
+        started_at=moment,
+        resources=capture_resource_snapshot(),
+    )
+
+
+def _complete_cli_stage(
+    manifest: RunManifest,
+    stage_name: str,
+    measurement: CliStageMeasurement,
+    *,
+    run_status: RunStatus,
+) -> None:
+    moment = datetime.now(timezone.utc)
+    record = manifest.stages[stage_name]
+    duration = max(0.0, (moment - measurement.started_at).total_seconds())
+    previous_status = record.status
+    record.status = StageStatus.COMPLETED
+    record.completed_at = moment
+    record.heartbeat_at = moment
+    record.duration_seconds = duration
+    record.resources = resources_since(measurement.resources)
+    if record.attempts:
+        attempt = record.attempts[-1]
+        attempt.status = StageStatus.COMPLETED
+        attempt.completed_at = moment
+        attempt.heartbeat_at = moment
+    append_stage_event(
+        record,
+        at=moment,
+        event="completed",
+        from_status=previous_status,
+        to_status=StageStatus.COMPLETED,
+    )
+    manifest.status = run_status
+    manifest.timings_seconds[stage_name] = duration
+
+
+def _fail_cli_stage(
+    manifest: RunManifest,
+    stage_name: str,
+    measurement: CliStageMeasurement,
+    error: Exception,
+) -> str:
+    moment = datetime.now(timezone.utc)
+    record = manifest.stages[stage_name]
+    duration = max(0.0, (moment - measurement.started_at).total_seconds())
+    message = redact_sensitive_text(str(error))
+    previous_status = record.status
+    record.status = StageStatus.FAILED
+    record.retryable = False
+    record.error = message
+    record.error_class = type(error).__name__
+    record.completed_at = moment
+    record.heartbeat_at = moment
+    record.duration_seconds = duration
+    record.resources = resources_since(measurement.resources)
+    if record.attempts:
+        attempt = record.attempts[-1]
+        attempt.status = StageStatus.FAILED
+        attempt.completed_at = moment
+        attempt.heartbeat_at = moment
+        attempt.error_class = type(error).__name__
+        attempt.error = message
+    append_stage_event(
+        record,
+        at=moment,
+        event="failed",
+        from_status=previous_status,
+        to_status=StageStatus.FAILED,
+        detail=message,
+    )
+    append_run_error(
+        manifest,
+        at=moment,
+        stage=stage_name,
+        error_class=type(error).__name__,
+        message=message,
+        retryable=False,
+        terminal=True,
+        attempt_number=record.attempt_count,
+    )
+    manifest.status = RunStatus.FAILED
+    manifest.timings_seconds[stage_name] = duration
+    return message
 
 
 @app.command()
@@ -66,6 +223,16 @@ def ingest(
         None,
         help="Optional human-readable run name.",
     ),
+    source_language: str = typer.Option(
+        "en",
+        "--source-language",
+        help="Release-enabled source language.",
+    ),
+    target_language: str = typer.Option(
+        "hi",
+        "--target-language",
+        help="Release-enabled target language.",
+    ),
 ) -> None:
     """Inspect and extract a source range into a new resumable run."""
     try:
@@ -80,24 +247,38 @@ def ingest(
         raise typer.BadParameter(str(error)) from error
     if end_ms <= start_ms:
         raise typer.BadParameter("End time must be greater than start time.")
+    try:
+        source_language, target_language = validate_release_language_pair(
+            source_language, target_language
+        )
+    except ConfigurationError as error:
+        raise typer.BadParameter(str(error)) from error
 
     run_id = _new_run_id(name or input.stem)
     run_directory = output.expanduser().resolve() / run_id
+    configuration_outputs = write_configuration_snapshot(
+        build_configuration_snapshot(
+            run_directory=run_directory,
+            source_language=source_language,
+            target_language=target_language,
+        ),
+        run_directory=run_directory,
+    )
     manifest = RunManifest(
         run_id=run_id,
         source_path=str(input),
         source_start_ms=start_ms,
         source_end_ms=end_ms,
+        source_language=source_language,
+        target_language=target_language,
+        outputs=configuration_outputs,
     )
     manifest.save(run_directory)
 
     stage = manifest.stages["ingest"]
-    stage.status = StageStatus.RUNNING
-    stage.started_at = datetime.now(timezone.utc)
-    manifest.status = RunStatus.RUNNING
+    measurement = _start_cli_stage(manifest, "ingest")
     manifest.save(run_directory)
 
-    started = time.monotonic()
     try:
         metadata, outputs = ingestor.ingest(
             source=input,
@@ -106,25 +287,22 @@ def ingest(
             end_ms=end_ms,
         )
     except MediaToolError as error:
-        message = str(error)
-        stage.status = StageStatus.FAILED
-        stage.error = message
-        stage.completed_at = datetime.now(timezone.utc)
-        manifest.status = RunStatus.FAILED
-        manifest.errors.append(message)
-        manifest.timings_seconds["ingest"] = time.monotonic() - started
+        message = _fail_cli_stage(manifest, "ingest", measurement, error)
         manifest.save(run_directory)
         typer.echo(f"Ingest failed: {message}", err=True)
         typer.echo(f"Run manifest: {run_directory / 'manifest.json'}")
         raise typer.Exit(code=1) from error
 
-    stage.status = StageStatus.COMPLETED
-    stage.completed_at = datetime.now(timezone.utc)
+    _complete_cli_stage(
+        manifest,
+        "ingest",
+        measurement,
+        run_status=RunStatus.INGESTED,
+    )
     stage.outputs = outputs
-    manifest.status = RunStatus.INGESTED
+    stage.provider = "ffmpeg"
     manifest.media = metadata
     manifest.outputs.update(outputs)
-    manifest.timings_seconds["ingest"] = time.monotonic() - started
     manifest.save(run_directory)
 
     typer.echo(f"Ingest complete: {run_directory}")
@@ -175,14 +353,9 @@ def transcribe(
         raise typer.Exit(code=1)
 
     audio_path = Path(audio_output)
-    stage.status = StageStatus.RUNNING
-    stage.started_at = datetime.now(timezone.utc)
-    stage.completed_at = None
-    stage.error = None
-    manifest.status = RunStatus.RUNNING
+    measurement = _start_cli_stage(manifest, "transcribe")
     manifest.save(run)
 
-    started = time.monotonic()
     try:
         transcript, segments, outputs = TranscriptionPipeline(
             model_name=model,
@@ -193,25 +366,25 @@ def transcribe(
             duration_ms=manifest.duration_ms,
         )
     except TranscriptionError as error:
-        message = str(error)
-        stage.status = StageStatus.FAILED
-        stage.error = message
-        stage.completed_at = datetime.now(timezone.utc)
-        manifest.status = RunStatus.FAILED
-        manifest.errors.append(message)
-        manifest.timings_seconds["transcribe"] = time.monotonic() - started
+        message = _fail_cli_stage(
+            manifest, "transcribe", measurement, error
+        )
         manifest.save(run)
         typer.echo(f"Transcribe failed: {message}", err=True)
         typer.echo(f"Run manifest: {run / 'manifest.json'}")
         raise typer.Exit(code=1) from error
 
-    stage.status = StageStatus.COMPLETED
-    stage.completed_at = datetime.now(timezone.utc)
+    _complete_cli_stage(
+        manifest,
+        "transcribe",
+        measurement,
+        run_status=RunStatus.TRANSCRIBED,
+    )
     stage.outputs = outputs
-    manifest.status = RunStatus.TRANSCRIBED
+    stage.provider = "whisperx"
+    stage.model = transcript.model
     manifest.models["whisperx"] = transcript.model
     manifest.outputs.update(outputs)
-    manifest.timings_seconds["transcribe"] = time.monotonic() - started
     manifest.save(run)
 
     typer.echo(f"Transcribe complete: {run}")
@@ -259,14 +432,9 @@ def segment(
         typer.echo("Segment requires completed transcription outputs.", err=True)
         raise typer.Exit(code=1)
 
-    stage.status = StageStatus.RUNNING
-    stage.started_at = datetime.now(timezone.utc)
-    stage.completed_at = None
-    stage.error = None
-    manifest.status = RunStatus.RUNNING
+    measurement = _start_cli_stage(manifest, "segment")
     manifest.save(run)
 
-    started = time.monotonic()
     try:
         artifact, translation_segments, outputs = UtterancePipeline().run(
             transcript_path=Path(transcript_output),
@@ -274,24 +442,21 @@ def segment(
             run_directory=run,
         )
     except UtteranceError as error:
-        message = str(error)
-        stage.status = StageStatus.FAILED
-        stage.error = message
-        stage.completed_at = datetime.now(timezone.utc)
-        manifest.status = RunStatus.FAILED
-        manifest.errors.append(message)
-        manifest.timings_seconds["segment"] = time.monotonic() - started
+        message = _fail_cli_stage(manifest, "segment", measurement, error)
         manifest.save(run)
         typer.echo(f"Segment failed: {message}", err=True)
         typer.echo(f"Run manifest: {run / 'manifest.json'}")
         raise typer.Exit(code=1) from error
 
-    stage.status = StageStatus.COMPLETED
-    stage.completed_at = datetime.now(timezone.utc)
+    _complete_cli_stage(
+        manifest,
+        "segment",
+        measurement,
+        run_status=RunStatus.SEGMENTED,
+    )
     stage.outputs = outputs
-    manifest.status = RunStatus.SEGMENTED
+    stage.provider = "deterministic"
     manifest.outputs.update(outputs)
-    manifest.timings_seconds["segment"] = time.monotonic() - started
     manifest.save(run)
 
     typer.echo(f"Segment complete: {run}")
@@ -377,14 +542,9 @@ def localize(
         typer.echo("Localize requires completed transcription segments.", err=True)
         raise typer.Exit(code=1)
 
-    stage.status = StageStatus.RUNNING
-    stage.started_at = datetime.now(timezone.utc)
-    stage.completed_at = None
-    stage.error = None
-    manifest.status = RunStatus.RUNNING
+    measurement = _start_cli_stage(manifest, "localize")
     manifest.save(run)
 
-    started = time.monotonic()
     try:
         localized_segments, outputs, model_name = LocalizationPipeline(
             model_name=model,
@@ -398,25 +558,30 @@ def localize(
             reuse_completed_batches=not force,
         )
     except LocalizationError as error:
-        message = str(error)
-        stage.status = StageStatus.FAILED
-        stage.error = message
-        stage.completed_at = datetime.now(timezone.utc)
-        manifest.status = RunStatus.FAILED
-        manifest.errors.append(message)
-        manifest.timings_seconds["localize"] = time.monotonic() - started
+        message = _fail_cli_stage(
+            manifest, "localize", measurement, error
+        )
         manifest.save(run)
         typer.echo(f"Localize failed: {message}", err=True)
         typer.echo(f"Run manifest: {run / 'manifest.json'}")
         raise typer.Exit(code=1) from error
 
-    stage.status = StageStatus.COMPLETED
-    stage.completed_at = datetime.now(timezone.utc)
+    _complete_cli_stage(
+        manifest,
+        "localize",
+        measurement,
+        run_status=RunStatus.LOCALIZED,
+    )
     stage.outputs = outputs
-    manifest.status = RunStatus.LOCALIZED
     manifest.models["translator"] = model_name
     manifest.outputs.update(outputs)
-    manifest.timings_seconds["localize"] = time.monotonic() - started
+    metrics = TranslationMetrics.model_validate_json(
+        Path(outputs["translation_metrics"]).read_text(encoding="utf-8")
+    )
+    stage.provider = metrics.provider
+    stage.model = metrics.model
+    stage.input_fingerprint = metrics.configuration_fingerprint
+    stage.cost_usd = metrics.cost_usd
     manifest.save(run)
 
     typer.echo(f"Localize complete: {run}")
@@ -497,14 +662,9 @@ def synthesize(
         typer.echo("Synthesize requires localized segments.", err=True)
         raise typer.Exit(code=1)
 
-    stage.status = StageStatus.RUNNING
-    stage.started_at = datetime.now(timezone.utc)
-    stage.completed_at = None
-    stage.error = None
-    manifest.status = RunStatus.RUNNING
+    measurement = _start_cli_stage(manifest, "synthesize")
     manifest.save(run)
 
-    started = time.monotonic()
     try:
         synthesized_segments, outputs, model_name = SynthesisPipeline(
             model_name=model,
@@ -517,34 +677,39 @@ def synthesize(
             reuse_completed_utterances=not force,
         )
     except SynthesisError as error:
-        message = str(error)
-        stage.status = StageStatus.FAILED
-        stage.error = message
-        stage.completed_at = datetime.now(timezone.utc)
-        manifest.status = RunStatus.FAILED
-        manifest.errors.append(message)
-        manifest.timings_seconds["synthesize"] = time.monotonic() - started
+        message = _fail_cli_stage(
+            manifest, "synthesize", measurement, error
+        )
         manifest.save(run)
         typer.echo(f"Synthesize failed: {message}", err=True)
         typer.echo(f"Run manifest: {run / 'manifest.json'}")
         raise typer.Exit(code=1) from error
 
-    stage.status = StageStatus.COMPLETED
-    stage.completed_at = datetime.now(timezone.utc)
+    _complete_cli_stage(
+        manifest,
+        "synthesize",
+        measurement,
+        run_status=RunStatus.SYNTHESIZED,
+    )
     stage.outputs = outputs
-    manifest.status = RunStatus.SYNTHESIZED
     manifest.models["tts"] = model_name
     manifest.outputs.update(outputs)
     metrics = SynthesisMetrics.model_validate_json(
         Path(outputs["synthesis_metrics"]).read_text(encoding="utf-8")
     )
     stage.provider = metrics.provider
+    stage.model = metrics.model
     stage.input_fingerprint = metrics.configuration_fingerprint
-    manifest.timings_seconds["synthesize"] = time.monotonic() - started
     manifest.save(run)
 
     typer.echo(f"Synthesize complete: {run}")
     typer.echo(f"Segments: {len(synthesized_segments)}")
+    typer.echo(
+        "Timing: "
+        f"{metrics.duration_within_primary_count}/{metrics.utterance_count} "
+        "within primary tolerance; "
+        f"{metrics.duration_unresolved_count} unresolved"
+    )
     typer.echo(json.dumps(manifest.public_summary(), indent=2))
 
 
@@ -564,6 +729,14 @@ def render(
         "--force",
         help="Re-render final media even when completed outputs exist.",
     ),
+    composition: CompositionMode = typer.Option(
+        CompositionMode.CLEAN_REPLACEMENT,
+        "--composition",
+        help=(
+            "Audio background mode: clean replacement, or duck the original "
+            "track during dubbed utterances."
+        ),
+    ),
 ) -> None:
     """Assemble synthesized speech into subtitle, audio, and video outputs."""
     try:
@@ -573,17 +746,34 @@ def render(
         raise typer.Exit(code=1) from error
 
     stage = manifest.stages.setdefault("render", StageRecord())
+    synthesized_output = manifest.outputs.get("synthesized_segments")
+    source_segment = manifest.outputs.get("source_segment")
+    policy = RenderPolicy(composition_mode=composition)
     if (
         not force
         and stage.status == StageStatus.COMPLETED
-        and _render_outputs_exist(stage.outputs)
+        and synthesized_output is not None
+        and source_segment is not None
+        and (
+            render_outputs_reusable(
+                outputs=stage.outputs,
+                synthesized_segments_path=Path(synthesized_output),
+                source_segment_path=Path(source_segment),
+                run_directory=run,
+                duration_ms=manifest.duration_ms,
+                policy=policy,
+            )
+            or (
+                composition == CompositionMode.CLEAN_REPLACEMENT
+                and "render_report" not in stage.outputs
+                and _render_outputs_exist(stage.outputs)
+            )
+        )
     ):
         typer.echo(f"Render already complete: {run}")
         typer.echo(json.dumps(manifest.public_summary(), indent=2))
         return
 
-    synthesized_output = manifest.outputs.get("synthesized_segments")
-    source_segment = manifest.outputs.get("source_segment")
     if not synthesized_output:
         typer.echo("Render requires synthesized segments.", err=True)
         raise typer.Exit(code=1)
@@ -591,40 +781,41 @@ def render(
         typer.echo("Render requires the ingested source segment.", err=True)
         raise typer.Exit(code=1)
 
-    stage.status = StageStatus.RUNNING
-    stage.started_at = datetime.now(timezone.utc)
-    stage.completed_at = None
-    stage.error = None
-    manifest.status = RunStatus.RUNNING
+    measurement = _start_cli_stage(manifest, "render")
     manifest.save(run)
 
-    started = time.monotonic()
     try:
-        plan, outputs = RenderPipeline().run(
+        pipeline = (
+            RenderPipeline()
+            if composition == CompositionMode.CLEAN_REPLACEMENT
+            else RenderPipeline(policy=policy)
+        )
+        plan, outputs = pipeline.run(
             synthesized_segments_path=Path(synthesized_output),
             source_segment_path=Path(source_segment),
             run_directory=run,
             duration_ms=manifest.duration_ms,
+            reuse_completed=not force,
         )
     except RenderError as error:
-        message = str(error)
-        stage.status = StageStatus.FAILED
-        stage.error = message
-        stage.completed_at = datetime.now(timezone.utc)
-        manifest.status = RunStatus.FAILED
-        manifest.errors.append(message)
-        manifest.timings_seconds["render"] = time.monotonic() - started
+        message = _fail_cli_stage(manifest, "render", measurement, error)
         manifest.save(run)
         typer.echo(f"Render failed: {message}", err=True)
         typer.echo(f"Run manifest: {run / 'manifest.json'}")
         raise typer.Exit(code=1) from error
 
-    stage.status = StageStatus.COMPLETED
-    stage.completed_at = datetime.now(timezone.utc)
+    _complete_cli_stage(
+        manifest,
+        "render",
+        measurement,
+        run_status=RunStatus.RENDERED,
+    )
     stage.outputs = outputs
-    manifest.status = RunStatus.RENDERED
+    stage.provider = "ffmpeg"
+    stage.input_fingerprint = RenderReport.model_validate_json(
+        Path(outputs["render_report"]).read_text(encoding="utf-8")
+    ).configuration_fingerprint
     manifest.outputs.update(outputs)
-    manifest.timings_seconds["render"] = time.monotonic() - started
     manifest.save(run)
 
     review_count = sum(1 for segment in plan.segments if segment.needs_review)
@@ -806,6 +997,205 @@ def worker(
 
 
 @app.command()
+def benchmark(
+    run: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Completed or partial run to measure without rerunning stages.",
+    ),
+    human_review: Path | None = typer.Option(
+        None,
+        "--human-review",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Completed human-review JSON based on the generated template.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Write a new benchmark revision even when verified reports exist.",
+    ),
+) -> None:
+    """Aggregate durable automated and human quality evidence for a run."""
+    try:
+        report, artifacts = build_benchmark(
+            run,
+            human_review_path=human_review,
+            reuse_completed=not force,
+        )
+    except (BenchmarkError, OSError, ValueError) as error:
+        typer.echo(f"Benchmark failed: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    outputs = artifacts.as_outputs(run)
+    typer.echo(f"Benchmark complete: {run}")
+    typer.echo(f"Release gate: {report.release_gate_status.value}")
+    typer.echo(f"JSON: {outputs['benchmark_json']}")
+    typer.echo(f"Markdown: {outputs['benchmark_markdown']}")
+    if report.human_review["status"] != "completed":
+        typer.echo(
+            "Human review template: " + outputs["human_review_template"]
+        )
+
+
+@app.command("retry")
+def retry_command(
+    run: Path = typer.Option(
+        ...,
+        "--run",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Run directory containing manifest.json.",
+    ),
+    from_stage: RetryStage = typer.Option(
+        ...,
+        "--from",
+        help="Earliest stage to invalidate and queue.",
+    ),
+    utterances: str | None = typer.Option(
+        None,
+        "--utterances",
+        help="Comma-separated stable IDs or numeric suffixes; omit for all.",
+    ),
+) -> None:
+    """Precisely invalidate failed work and its downstream artifacts."""
+    selectors = (
+        [item.strip() for item in utterances.split(",") if item.strip()]
+        if utterances is not None
+        else []
+    )
+    try:
+        report = retry_run(
+            run,
+            from_stage=from_stage,
+            utterance_selectors=selectors,
+        )
+    except (RetryError, OSError, ValueError) as error:
+        typer.echo(f"Retry failed: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(
+        f"Queued {report.queued_stage} for {len(report.affected_utterance_ids)} "
+        f"affected utterance(s)."
+    )
+    typer.echo(f"Retry request: {report.request_id}")
+    typer.echo(f"Invalidated sidecars: {len(report.invalidated_sidecars)}")
+
+
+@app.command("release-check")
+def release_check(
+    run: Path = typer.Option(
+        ...,
+        "--run",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+    ),
+    target: DeploymentTarget = typer.Option(
+        DeploymentTarget.LOCAL,
+        "--target",
+        help="Readiness target; AWS remains blocked until measured prerequisites exist.",
+    ),
+) -> None:
+    """Check benchmark and deployment evidence without changing a run."""
+    try:
+        report = assess_deployment_readiness(run, target=target)
+    except (OSError, ValueError) as error:
+        typer.echo(f"Release check failed: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(readiness_json(report), nl=False)
+    if report.status != ReadinessStatus.PASSED:
+        raise typer.Exit(code=1)
+
+
+@app.command("language-check")
+def language_check(
+    run: Path = typer.Option(
+        ...,
+        "--run",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Passing Hindi baseline run.",
+    ),
+    candidate: str = typer.Option(..., "--candidate"),
+    evaluation_set: Path | None = typer.Option(
+        None,
+        "--evaluation-set",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+    ),
+) -> None:
+    """Enforce Hindi quality and evaluation-set gates before expansion."""
+    try:
+        report = assess_language_expansion(
+            run,
+            candidate_language=candidate,
+            evaluation_set_path=evaluation_set,
+        )
+    except (OSError, ValueError) as error:
+        typer.echo(f"Language check failed: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(readiness_json(report), nl=False)
+    if report.status != ReadinessStatus.PASSED:
+        raise typer.Exit(code=1)
+
+
+@app.command("research-check")
+def research_check(
+    decision: Path = typer.Option(
+        ...,
+        "--decision",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+    ),
+) -> None:
+    """Require the X/Y/Z/W/E evidence contract before model training."""
+    report = assess_research_readiness(decision)
+    typer.echo(readiness_json(report), nl=False)
+    if report.status != ReadinessStatus.PASSED:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def status(
+    run: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+    ),
+) -> None:
+    """Print the same durable run status document used by the web API."""
+    try:
+        payload = build_run_status(run)
+    except (OSError, ValueError) as error:
+        typer.echo(f"Unable to read run status: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(payload.model_dump(mode="json"), indent=2))
+
+
+@app.command()
 def show(
     run: Path = typer.Argument(
         ...,
@@ -816,13 +1206,13 @@ def show(
         resolve_path=True,
     ),
 ) -> None:
-    """Print the public summary of an existing run."""
+    """Print run status (legacy alias for `dub-mvp status`)."""
     try:
-        manifest = RunManifest.load(run)
+        payload = build_run_status(run)
     except (OSError, ValueError) as error:
-        typer.echo(f"Unable to read run manifest: {error}", err=True)
+        typer.echo(f"Unable to read run status: {error}", err=True)
         raise typer.Exit(code=1) from error
-    typer.echo(json.dumps(manifest.public_summary(), indent=2))
+    typer.echo(json.dumps(payload.model_dump(mode="json"), indent=2))
 
 
 def _new_run_id(name: str) -> str:

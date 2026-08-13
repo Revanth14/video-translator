@@ -17,6 +17,7 @@ from dub_mvp.manifest import (
     StageAttempt,
     StageRecord,
     StageStatus,
+    append_run_error,
     append_stage_event,
     mutate_manifest,
     renew_lease,
@@ -420,7 +421,26 @@ def _exhaust_attempts(
     record.worker_id = None
     record.lease_expires_at = None
     manifest.status = RunStatus.FAILED
-    manifest.errors.append(message)
+    append_run_error(
+        manifest,
+        at=moment,
+        stage=stage,
+        error_class="attempts_exhausted",
+        message=message,
+        retryable=False,
+        terminal=True,
+        attempt_number=(
+            record.attempt_count if record.attempt_count > 0 else None
+        ),
+    )
+    append_stage_event(
+        record,
+        at=moment,
+        event="attempts_exhausted",
+        from_status=StageStatus.QUEUED,
+        to_status=StageStatus.FAILED,
+        detail=message,
+    )
 
 
 def _abandon_expired_attempt(record: StageRecord, moment: datetime) -> None:
@@ -435,6 +455,16 @@ def _abandon_expired_attempt(record: StageRecord, moment: datetime) -> None:
     attempt.error = (
         f"Lease held by {attempt.worker_id or 'unknown worker'} expired "
         "and the stage was reclaimed."
+    )
+    append_stage_event(
+        record,
+        at=moment,
+        event="lease_expired",
+        from_status=StageStatus.RUNNING,
+        to_status=StageStatus.FAILED,
+        worker_id=attempt.worker_id,
+        lease_generation=attempt.lease_generation,
+        detail=attempt.error,
     )
 
 

@@ -99,6 +99,11 @@ def test_unexpected_error_fails_the_stage_terminally(tmp_path: Path) -> None:
     assert record.error_class == "unexpected_error"
     assert "KeyError" in (record.error or "")
     assert not record.retryable
+    assert record.duration_seconds is not None
+    assert record.resources is not None
+    assert record.resources.max_rss_mb > 0
+    assert record.attempts[0].status == StageStatus.FAILED
+    assert record.events[-1].event == "failed"
 
 
 def test_stage_success_is_recorded_when_the_manifest_changed_mid_stage(
@@ -120,3 +125,38 @@ def test_stage_success_is_recorded_when_the_manifest_changed_mid_stage(
     assert manifest.status == RunStatus.TRANSCRIBED
     assert manifest.models["whisperx"] == "fake-whisperx"
     assert record.duration_seconds is not None
+    assert record.resources is not None
+    assert record.resources.max_rss_mb > 0
+    assert record.attempts[0].status == StageStatus.COMPLETED
+    assert record.events[-1].event == "completed"
+
+
+def test_low_disk_space_prevents_work_and_records_visible_failure(
+    tmp_path: Path,
+) -> None:
+    class MustNotRun:
+        def run(self, **_):
+            raise AssertionError("pipeline must not start without scratch space")
+
+    run_directory = prepared_run(tmp_path)
+    runner = LocalJobRunner(
+        transcription_pipeline=MustNotRun(),
+        background=False,
+        minimum_free_bytes=1024,
+        disk_free_bytes=lambda _: 100,
+    )
+
+    runner.submit_stage(
+        StageRequest(run_directory=run_directory, stage="transcribe")
+    )
+
+    manifest = RunManifest.load(run_directory)
+    record = manifest.stages["transcribe"]
+    assert record.status == StageStatus.FAILED
+    assert record.error_class == "StorageCapacityError"
+    assert record.error == (
+        "Insufficient disk space for transcribe: "
+        "100 bytes free, 1024 bytes required."
+    )
+    assert manifest.error_records[-1].error_class == "StorageCapacityError"
+    assert record.events[-1].event == "failed"

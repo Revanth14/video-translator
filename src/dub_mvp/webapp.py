@@ -15,6 +15,12 @@ from urllib.parse import unquote, urlparse
 
 from pydantic import ValidationError
 
+from dub_mvp.configuration import (
+    ConfigurationError,
+    build_configuration_snapshot,
+    validate_release_language_pair,
+    write_configuration_snapshot,
+)
 from dub_mvp.localize import Glossary, TranslationContext
 from dub_mvp.manifest import RunManifest
 from dub_mvp.media import MediaIngestor, MediaToolError, media_duration_ms
@@ -56,6 +62,10 @@ class WebJobService:
     ) -> None:
         self.runs_directory = runs_directory.expanduser().resolve()
         self.media_ingestor = ingestor or MediaIngestor()
+        self.transcription_pipeline = transcription_pipeline
+        self.localization_pipeline = localization_pipeline
+        self.synthesis_pipeline = synthesis_pipeline
+        self.render_pipeline = render_pipeline
         selected_runner = runner or LocalJobRunner(
             ingestor=self.media_ingestor,
             transcription_pipeline=transcription_pipeline,
@@ -110,6 +120,12 @@ class WebJobService:
         if not source_file.is_file() or source_file.stat().st_size == 0:
             raise WebAppError("Uploaded video is empty.")
         start_ms = _parse_time(start, "start")
+        try:
+            source_language, target_language = validate_release_language_pair(
+                "en", target_language
+            )
+        except ConfigurationError as error:
+            raise WebAppError(str(error)) from error
 
         run_id = _new_web_run_id(filename)
         run_directory = self.runs_directory / run_id
@@ -163,12 +179,31 @@ class WebJobService:
             _write_model_json(voice_reference_path, voice_catalog)
             _validate_persisted_voice_catalog(voice_reference_path)
 
+            configuration_outputs = write_configuration_snapshot(
+                build_configuration_snapshot(
+                    run_directory=run_directory,
+                    source_language=source_language,
+                    target_language=target_language,
+                    translation_pipeline=self.localization_pipeline,
+                    synthesis_pipeline=self.synthesis_pipeline,
+                    render_pipeline=self.render_pipeline,
+                    voice_catalog_path=voice_reference_path,
+                    glossary_path=input_directory / "glossary.json",
+                    translation_context_path=(
+                        input_directory / "translation-context.json"
+                    ),
+                ),
+                run_directory=run_directory,
+            )
+
             manifest = RunManifest(
                 run_id=run_id,
                 source_path=str(source_path),
                 source_start_ms=start_ms,
                 source_end_ms=end_ms,
+                source_language=source_language,
                 target_language=target_language,
+                outputs=configuration_outputs,
             )
             manifest.save(run_directory)
         except Exception:

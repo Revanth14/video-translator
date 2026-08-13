@@ -3,102 +3,212 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#eef3ff">
   <title>Video Translator</title>
-  <meta name="description" content="Translate and dub videos with Video Translator.">
+  <meta name="description" content="Translate and dub videos into Hindi while preserving timing and voice.">
   <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+  <div class="ambient ambient-three" aria-hidden="true"></div>
+
   <main class="app">
-    <header>
-      <div class="brand">
+    <header class="topbar glass-control">
+      <a class="brand" href="./" aria-label="Video Translator home">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span>
+          <span></span>
+        </span>
         <span>Video Translator</span>
-      </div>
-      <button id="resetButton" type="button">Reset</button>
+      </a>
+      <span class="privacy-note">
+        <span class="privacy-dot" aria-hidden="true"></span>
+        Local workspace
+      </span>
+      <button class="reset-button" id="resetButton" type="button">
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <path d="M4.8 6.2A6 6 0 1 1 4 12"/>
+          <path d="M4.8 2.8v3.8h3.8"/>
+        </svg>
+        <span>Reset</span>
+      </button>
     </header>
 
-    <section class="grid">
-      <div class="panel source-panel">
+    <section class="hero" aria-labelledby="page-title">
+      <div class="eyebrow glass-control">
+        <span class="spark" aria-hidden="true"></span>
+        English to Hindi dubbing
+      </div>
+      <h1 id="page-title">Let your video<br><span>speak further.</span></h1>
+      <p>Translate speech, preserve timing, and create a natural Hindi dub—all in one quiet workspace.</p>
+    </section>
+
+    <section class="workspace">
+      <article class="panel source-panel">
         <div class="panel-head">
-          <h1>Translate video</h1>
-          <span id="uploadStatus">No file</span>
+          <div>
+            <span class="section-kicker">Source</span>
+            <h2>Translate video</h2>
+          </div>
+          <span class="status-pill" id="uploadStatus">No file</span>
+        </div>
+
+        <div class="error-banner" id="errorBanner" role="alert" hidden>
+          <span class="error-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20">
+              <path d="M10 6v4m0 3h.01"/>
+              <circle cx="10" cy="10" r="7"/>
+            </svg>
+          </span>
+          <span>
+            <strong id="errorTitle">Couldn’t start translation</strong>
+            <small id="errorMessage"></small>
+          </span>
         </div>
 
         <label class="dropzone" id="dropzone">
           <input id="videoInput" type="file" accept="video/*">
           <canvas id="posterCanvas" width="960" height="540" aria-hidden="true"></canvas>
-          <span>
+          <span class="dropzone-content">
+            <span class="upload-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M12 16V5m0 0L8.5 8.5M12 5l3.5 3.5"/>
+                <path d="M5 14v3.5A1.5 1.5 0 0 0 6.5 19h11a1.5 1.5 0 0 0 1.5-1.5V14"/>
+              </svg>
+            </span>
             <strong>Upload video</strong>
-            <small>Drop a file or click to browse</small>
+            <small>Drop a file here or choose from your device</small>
+            <span class="format-note">MP4, MOV or WebM · up to 8 GB</span>
           </span>
         </label>
 
-        <video id="sourceVideo" controls playsinline></video>
+        <div class="video-frame">
+          <video id="sourceVideo" controls playsinline></video>
+          <span class="video-badge">Original</span>
+        </div>
 
-        <div class="controls">
-          <label>
-            Language
-            <select id="languageSelect">
-              <option value="hi">Hindi</option>
-              <option value="es">Spanish</option>
-              <option value="fr">French</option>
-              <option value="de">German</option>
-              <option value="ja">Japanese</option>
-            </select>
+        <div class="settings-row">
+          <label class="select-field">
+            <span>Translate to</span>
+            <span class="select-shell">
+              <span class="language-symbol" aria-hidden="true">अ</span>
+              <select id="languageSelect" aria-label="Target language">
+                <option value="hi">Hindi</option>
+              </select>
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4"/></svg>
+            </span>
           </label>
+
+          <button class="primary" id="startButton" type="button" disabled>
+            <span>Start translation</span>
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <path d="M4 10h11m-4-4 4 4-4 4"/>
+            </svg>
+          </button>
         </div>
 
         <details class="advanced">
-          <summary>Advanced</summary>
-          <div class="controls">
-            <label>
-              Glossary
+          <summary>
+            <span class="summary-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20"><path d="M3.5 6.5h13M6 3.5v6M3.5 13.5h13M14 10.5v6"/></svg>
+            </span>
+            <span>
+              <strong>Advanced</strong>
+              <small>Glossary and voice reference</small>
+            </span>
+            <svg class="chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4"/></svg>
+          </summary>
+          <div class="advanced-fields">
+            <label class="file-field">
+              <span>Glossary</span>
+              <small>Optional JSON terminology</small>
               <input id="glossaryInput" type="file" accept="application/json,.json">
             </label>
 
-            <label>
-              Voice reference
+            <label class="file-field">
+              <span>Voice reference</span>
+              <small>Optional consented voice JSON</small>
               <input id="voiceReferenceInput" type="file" accept="application/json,.json">
             </label>
           </div>
         </details>
+      </article>
 
-        <button class="primary" id="startButton" type="button" disabled>
-          Start translation
-        </button>
-        <button class="secondary" id="retryButton" type="button" hidden>
-          Retry
-        </button>
-      </div>
-
-      <div class="panel result">
+      <article class="panel result-panel">
         <div class="panel-head">
-          <h2>Result</h2>
-          <span id="runStatus">Ready</span>
+          <div>
+            <span class="section-kicker">Output</span>
+            <h2>Result</h2>
+          </div>
+          <span class="status-pill ready" id="runStatus">Ready</span>
         </div>
 
         <div class="preview" id="resultPreview">
-          <span>Result appears here</span>
+          <span class="empty-preview">
+            <span class="result-orb" aria-hidden="true">
+              <span></span>
+              <svg viewBox="0 0 28 28"><path d="m11 9 8 5-8 5V9Z"/></svg>
+            </span>
+            <strong>Your Hindi video will appear here</strong>
+            <small>You can leave this page. Progress is saved automatically.</small>
+          </span>
         </div>
 
-        <div class="progress">
-          <div id="progressBar"></div>
+        <div class="progress-block">
+          <div class="progress-copy">
+            <span>Translation progress</span>
+            <span id="progressValue">0%</span>
+          </div>
+          <div class="progress" role="progressbar" aria-label="Translation progress" aria-valuemin="0" aria-valuemax="100">
+            <div id="progressBar"></div>
+          </div>
         </div>
 
-        <div class="steps" id="stageGrid">
-          <span data-stage="upload">Upload</span>
-          <span data-stage="transcribe">Transcribe</span>
-          <span data-stage="translate">Translate</span>
-          <span data-stage="voice">Voice</span>
-          <span data-stage="render">Render</span>
+        <div class="steps" id="stageGrid" aria-label="Translation stages">
+          <span data-stage="upload"><i></i><small>Upload</small></span>
+          <span data-stage="transcribe"><i></i><small>Transcribe</small></span>
+          <span data-stage="translate"><i></i><small>Translate</small></span>
+          <span data-stage="voice"><i></i><small>Voice</small></span>
+          <span data-stage="render"><i></i><small>Render</small></span>
+        </div>
+
+        <div class="run-details" aria-live="polite">
+          <span>
+            <i class="metric-icon stages-icon" aria-hidden="true"></i>
+            <span id="stageProgress">0 of 6 stages complete</span>
+          </span>
+          <span>
+            <i class="metric-icon voice-icon" aria-hidden="true"></i>
+            <span id="utteranceProgress">0 of 0 utterances voiced</span>
+          </span>
+          <span>
+            <i class="metric-icon attempt-icon" aria-hidden="true"></i>
+            <span id="attemptProgress">0 attempts</span>
+          </span>
         </div>
 
         <div class="downloads">
-          <a class="download-link disabled" id="videoDownload">Video</a>
-          <a class="download-link disabled" id="subtitleDownload">Subtitles</a>
-          <a class="download-link disabled" id="audioDownload">Audio</a>
+          <a class="download-link disabled" id="videoDownload">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5.5h12v9H4zM8 8l5 2-5 2V8Z"/></svg>
+            <span id="videoDownloadLabel">Video</span>
+          </a>
+          <a class="download-link disabled" id="subtitleDownload">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5h13v10h-13zM6 9h3m2 0h3m-8 3h5"/></svg>
+            <span>Subtitles</span>
+          </a>
+          <a class="download-link disabled" id="audioDownload">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8v4m3-6v8m3-10v12m3-9v6m3-4v2"/></svg>
+            <span>Audio</span>
+          </a>
         </div>
-      </div>
+      </article>
     </section>
+
+    <footer>
+      <span>Built for clear, faithful translation.</span>
+      <span>Your run stays resumable from this device.</span>
+    </footer>
   </main>
 
   <script src="./app.js"></script>

@@ -149,3 +149,10 @@ def test_ui_command_help_includes_customer_review_language() -> None:
 
     assert result.exit_code == 0
     assert "customer-facing dubbing review UI" in result.output
+
+
+def test_internal_ui_renders_durable_attempt_progress() -> None:
+    from dub_mvp.ui import HTML
+
+    assert "summary.stage_details" in HTML
+    assert 'progress.attempts?.total' in HTML

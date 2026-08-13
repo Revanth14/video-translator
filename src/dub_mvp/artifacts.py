@@ -153,6 +153,29 @@ def verify_artifact(
     return ArtifactVerification(valid=True)
 
 
+def verify_artifact_integrity(
+    metadata: ArtifactMetadata,
+    *,
+    root: Path,
+) -> ArtifactVerification:
+    """Verify durable output proof without asserting a caller-owned input set.
+
+    This is appropriate for release/readiness inspection of an already
+    published artifact. Pipeline reuse must call :func:`verify_artifact`
+    instead, because integrity alone does not prove that inputs still match.
+    """
+    if metadata.status != ArtifactStatus.COMPLETED:
+        return ArtifactVerification(valid=False, reason="artifact is not completed")
+    path = root / metadata.path
+    if not path.is_file():
+        return ArtifactVerification(valid=False, reason="artifact file is missing")
+    if path.stat().st_size != metadata.size_bytes:
+        return ArtifactVerification(valid=False, reason="artifact size mismatch")
+    if sha256_file(path) != metadata.output_sha256:
+        return ArtifactVerification(valid=False, reason="artifact checksum mismatch")
+    return ArtifactVerification(valid=True)
+
+
 def write_artifact_metadata(path: Path, metadata: ArtifactMetadata) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_name(f".{path.name}.tmp")
@@ -177,4 +200,3 @@ def _json_default(value: Any) -> Any:
             "on every call, so no artifact would ever be reusable."
         )
     raise TypeError(f"Unsupported fingerprint input: {type(value).__name__}")
-
