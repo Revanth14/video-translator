@@ -13,3 +13,5 @@ runs/*
 !runs/.gitkeep
 
 models/
+
+evaluation/

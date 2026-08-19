@@ -77,6 +77,22 @@ intermediates.
 
 ## Benchmark
 
+Before spending provider or GPU capacity on the qualifying long-form run, use
+the strict benchmark readiness profile:
+
+```bash
+uv run dub-mvp preflight \
+  --profile benchmark \
+  --input-video evaluation/authorized-35-minute-source.mp4 \
+  --voice-reference evaluation/voice-catalog.json
+```
+
+Unlike the default local preflight, this exits nonzero unless the 30–45 minute
+input contract, FFmpeg, NVIDIA/CUDA runtime, WhisperX/OpenAI/IndicF5/Torch
+modules, API credential, translation pricing, and consented voice catalog are
+all present. It validates readiness; it does not call providers or spend GPU
+capacity.
+
 Aggregate the run's durable evidence without rerunning providers:
 
 ```bash

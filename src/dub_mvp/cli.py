@@ -38,7 +38,11 @@ from dub_mvp.observability import (
     capture_resource_snapshot,
     resources_since,
 )
-from dub_mvp.preflight import build_preflight_report, report_to_json
+from dub_mvp.preflight import (
+    PreflightProfile,
+    build_preflight_report,
+    report_to_json,
+)
 from dub_mvp.readiness import (
     DeploymentTarget,
     ReadinessStatus,
@@ -827,6 +831,14 @@ def render(
 
 @app.command()
 def preflight(
+    profile: PreflightProfile = typer.Option(
+        PreflightProfile.LOCAL,
+        "--profile",
+        help=(
+            "Readiness profile. 'local' keeps provider checks advisory; "
+            "'benchmark' requires the complete GPU/provider/cost/input setup."
+        ),
+    ),
     run: Path | None = typer.Option(
         None,
         "--run",
@@ -847,11 +859,23 @@ def preflight(
         resolve_path=True,
         help="Optional voice catalog or legacy reference JSON to validate.",
     ),
+    input_video: Path | None = typer.Option(
+        None,
+        "--input-video",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Authorized 30-45 minute source required by benchmark profile.",
+    ),
 ) -> None:
-    """Check local readiness before provisioning or using GPU runtime."""
+    """Check local or strict long-form benchmark readiness."""
     report = build_preflight_report(
+        profile=profile,
         run_directory=run,
         voice_reference_path=voice_reference,
+        input_video_path=input_video,
     )
     typer.echo(report_to_json(report).rstrip())
     if not report.ok:

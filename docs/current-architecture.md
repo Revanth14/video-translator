@@ -4,9 +4,10 @@ Describes the system as it stands. **Update this file in the same change that
 alters the architecture** — a stale architecture doc is worse than none,
 because agents and new contributors trust it.
 
-Last verified: 2026-08-13 (full suite passing, including process interruption,
+Last verified: 2026-08-18 (234 tests passing, including process interruption,
 real FFmpeg duration correction, full render/decode, killed-mux recovery,
-selective retry, low-disk rejection, and release-readiness gates).
+selective retry, low-disk rejection, and release- and benchmark-readiness
+gates).
 
 ## Non-negotiable invariants
 
@@ -250,6 +251,15 @@ checksums, and duration/render policy fingerprints into verified
 `input/pipeline-config.json`. The release registry currently admits only
 `en→hi`; the HTTP API and ingest CLI reject other pairs before durable work is
 queued.
+
+`preflight` has two deliberately different profiles. The default `local`
+profile requires FFmpeg/FFprobe and reports absent provider modules or
+credentials as warnings, which keeps fixture and CPU-only development usable.
+`preflight --profile benchmark` is the spending gate for the qualifying
+long-form run: it exits nonzero unless an inspectable 30–45 minute input,
+consented voice catalog, NVIDIA tooling, Torch-visible CUDA device,
+WhisperX/OpenAI/IndicF5/Torch modules, OpenAI credential, and explicit current
+translation token prices are all present. It performs no provider calls.
 
 `language-check` does not enable a language. It verifies that the Hindi
 baseline has a checksum-valid passing benchmark and that the candidate has a
