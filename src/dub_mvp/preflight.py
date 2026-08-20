@@ -194,7 +194,7 @@ def _indicf5_runtime_check(*, required: bool) -> PreflightCheck:
                 resolved,
                 "-c",
                 (
-                    "import f5_tts, torch; "
+                    "import f5_tts, torch, torchaudio, torchcodec; "
                     "assert torch.cuda.is_available(); "
                     "print(torch.cuda.get_device_name(0))"
                 ),

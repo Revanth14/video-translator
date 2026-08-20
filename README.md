@@ -201,6 +201,10 @@ an AWS deployment.
 ## Deployment
 
 - Copy `.env.example` to `.env` and fill provider credentials.
-- Run `scripts/bootstrap-gpu.sh` on a fresh Ubuntu GPU droplet.
+- Run `scripts/bootstrap-gpu.sh` on a fresh Ubuntu Python 3.10 GPU host. It
+  installs the exact isolated IndicF5 dependency lock, including TorchCodec,
+  and checksum-verifies pinned model/vocoder artifacts before preflight.
+- Provide `HF_TOKEN` during the first bootstrap when the qualified model cache
+  is absent; never persist that token or authorized voice media in an image.
 - Follow `docs/gpu-droplet-runbook.md`.
 - See `docs/gpu-worker-contract.md` for the manifest and queue contract.

@@ -10,6 +10,7 @@ from dub_mvp.manifest import MediaMetadata, RunManifest
 from dub_mvp.preflight import (
     PreflightCheck,
     PreflightProfile,
+    _indicf5_runtime_check,
     build_preflight_report,
     report_to_json,
 )
@@ -57,6 +58,34 @@ def write_voice_catalog(
         encoding="utf-8",
     )
     return catalog_path
+
+
+def test_indicf5_preflight_checks_the_audio_decoder_runtime(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("VIDEO_TRANSLATOR_INDICF5_PYTHON", "/runtime/python")
+    monkeypatch.setattr(
+        "dub_mvp.preflight.shutil.which",
+        lambda executable: executable,
+    )
+
+    def run(arguments, **kwargs):
+        captured["arguments"] = arguments
+        captured["environment"] = kwargs["env"]
+        return SimpleNamespace(returncode=0, stdout="Tesla T4\n", stderr="")
+
+    monkeypatch.setattr("dub_mvp.preflight.subprocess.run", run)
+
+    check = _indicf5_runtime_check(required=True)
+
+    assert check.status == "pass"
+    command = captured["arguments"]
+    assert isinstance(command, list)
+    assert "torchaudio, torchcodec" in command[2]
+    environment = captured["environment"]
+    assert isinstance(environment, dict)
+    assert environment["HF_HUB_OFFLINE"] == "1"
 
 
 def test_preflight_reports_missing_required_tools(monkeypatch) -> None:

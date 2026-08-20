@@ -4,7 +4,7 @@ Describes the system as it stands. **Update this file in the same change that
 alters the architecture** — a stale architecture doc is worse than none,
 because agents and new contributors trust it.
 
-Last verified: 2026-08-20 (293 tests passing, including process interruption,
+Last verified: 2026-08-20 (296 tests passing, including process interruption,
 real FFmpeg duration correction, full render/decode, killed-mux recovery,
 selective retry, low-disk rejection, and release- and benchmark-readiness
 gates).
@@ -402,6 +402,17 @@ process test kills the runtime after the first completed utterance and proves
 that the next stage attempt starts a new runtime, reuses the verified first WAV,
 and requests only the unfinished utterance.
 
+The real Phase 2 runtime gate passed on 2026-08-20 from revision `bd6e88a` on
+one `g4dn.xlarge` (Tesla T4). Five sequential utterances used one child process:
+14.21 s was spent in the one-time load/shutdown path and the complete run took
+81.89 s. Per-utterance generation took 10.81, 11.15, 19.44, 11.46, and 14.40 s
+for target windows of 1.6, 4.2, 11, 5, and 6.5 s. Peak measured GPU memory was
+1,643 MiB, peak utilization reached 100%, and process max RSS was 3,424,468 KB.
+Every output was within 0.7% of its target duration. Closing the stage left no
+IndicF5 child or NVIDIA compute process. Human review passed all five for at
+least 4/5 intelligibility, acceptable voice similarity, no severe filler or
+hallucination, and no clipped words.
+
 IndicF5 raw-speech and synthesis-configuration fingerprints include the model
 revision, runtime protocol and implementation revision,
 `fixed_timeline_budget_v1`, `single_batch_v1`, the text-normalization policy,
@@ -606,11 +617,10 @@ changed stage evidence, artifacts, configuration, or human review does.
   technical tokens proven by the Phase 1 evaluation. Unknown Latin tokens are
   measured and left unchanged; broader pronunciation handling needs its own
   evaluated term set before the lexicon expands.
-- The stage-scoped IndicF5 protocol, stderr drain, child-death recovery, and
-  single-load contract are exercised with real local child processes, but the
-  GPU host was terminated before Phase 2. A qualified GPU run must still
-  measure actual model loads, first-utterance latency, warm-utterance latency,
-  VRAM, and shutdown behavior before the runtime gate is considered passed.
+- The real IndicF5 GPU gate covers one five-utterance stage, not the complete
+  30–45 minute workload. Long-form thermal behavior, memory over many
+  utterances, interruption/resume on Spot, and cost per source minute remain
+  part of the full benchmark rather than being inferred from this short gate.
 - `cli.py` still holds a manifest across pipeline execution (the pattern fixed
   in `runner.py`). Safe only because nothing else writes during a CLI run; it
   will conflict if an operator runs a stage while a worker holds a lease.
@@ -632,11 +642,12 @@ changed stage evidence, artifacts, configuration, or human review does.
   run is still required to exercise provider-specific timeout/rate-limit
   behavior and every major-stage kill scenario at long-form scale.
 - Phase 14 is deliberately not complete. `Dockerfile` packages the core
-  executor and FFmpeg, but it is not a qualified GPU image and does not install
-  the undeclared WhisperX/OpenAI/IndicF5/torch runtime. There is no S3 artifact
-  backend, remote conditional state/fencing implementation, incremental
-  upload, AWS Batch resource, Spot-interruption proof, or measured cloud cost.
-  `release-check --target aws` makes each absence an explicit blocker.
+  executor and FFmpeg but is not a qualified GPU container. The EC2 Phase 2
+  image qualifies only the isolated IndicF5/Torch runtime; WhisperX/OpenAI,
+  an S3 artifact backend, remote conditional state/fencing, incremental upload,
+  AWS Batch resources, Spot-interruption proof, and measured end-to-end cloud
+  cost are still absent. `release-check --target aws` makes those absences
+  explicit blockers.
 - Phase 15 is deliberately not complete. English→Hindi is the only admitted
   pair; no second language/provider/model or trained component has been added.
   Readiness contracts prevent expansion without a passing Hindi benchmark,
@@ -657,11 +668,15 @@ changed stage evidence, artifacts, configuration, or human review does.
 
 ## Environment
 
-- `pyproject.toml` declares only `pydantic` and `typer`. The real GPU runtime
-  (WhisperX, OpenAI, IndicF5, torch) is undeclared and provided by
-  `scripts/bootstrap-gpu.sh`. The current container intentionally captures the
-  core executor and FFmpeg only; benchmark-selected GPU dependencies remain an
-  AWS-readiness blocker.
+- `pyproject.toml` declares only the lightweight core (`pydantic` and `typer`).
+  The isolated IndicF5 environment is separately pinned in
+  `requirements-indicf5-gpu.txt`; it includes the GPU-qualified Torch,
+  TorchAudio, TorchCodec, Transformers, and exact AI4Bharat Git revision.
+  `scripts/bootstrap-gpu.sh` installs that environment and
+  `scripts/cache-indicf5-models.py` downloads exact model/vocoder revisions and
+  rejects checksum mismatches. WhisperX/OpenAI remain deployment-provided, and
+  the current container intentionally captures the core executor and FFmpeg
+  only.
 - Python is pinned to `>=3.10,<3.11`.
 - Translation cost estimation reads
   `VIDEO_TRANSLATOR_OPENAI_INPUT_USD_PER_MILLION` and
