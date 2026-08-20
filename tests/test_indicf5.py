@@ -9,6 +9,7 @@ from dub_mvp.indicf5 import (
     describe_prompt_scripts,
     dominant_script,
     indicf5_duration_plan,
+    indicf5_text_plan,
     single_text_batch,
     speech_units,
     validate_reference_script,
@@ -20,6 +21,57 @@ HINDI_REFERENCE = (
     "मेरा नाम राहुल है और मैं इस वीडियो में आपको एक नई तकनीक के बारे में "
     "बताने जा रहा हूँ। यह बहुत आसान है।"
 )
+
+
+def test_hindi_text_plan_normalizes_evaluated_technical_terms() -> None:
+    source = (
+        "पहले आप API key को environment variable में डालिए, फिर deployment "
+        "script चलाइए।"
+    )
+
+    plan = indicf5_text_plan(text=source, target_language="hi-IN")
+
+    assert plan.source_text == source
+    assert plan.tts_text == (
+        "पहले आप एपीआई की को एनवायरनमेंट वेरिएबल में डालिए, फिर "
+        "डिप्लॉयमेंट स्क्रिप्ट चलाइए।"
+    )
+    assert plan.policy_version == "hindi_codeswitch_v1"
+    assert plan.replacement_count == 6
+    assert plan.unmapped_latin_token_count == 0
+    assert plan.changed
+
+
+def test_hindi_text_plan_does_not_guess_unknown_latin_pronunciations() -> None:
+    plan = indicf5_text_plan(
+        text="GitHub खोलिए और API key डालिए।",
+        target_language="hi",
+    )
+
+    assert plan.tts_text == "GitHub खोलिए और एपीआई की डालिए।"
+    assert plan.replacement_count == 2
+    assert plan.unmapped_latin_token_count == 1
+
+
+def test_hindi_text_plan_does_not_rewrite_urls_or_identifiers() -> None:
+    source = "api.example.com खोलिए और deployment_script चलाइए।"
+
+    plan = indicf5_text_plan(text=source, target_language="hi")
+
+    assert plan.tts_text == source
+    assert plan.replacement_count == 0
+    assert plan.unmapped_latin_token_count == 2
+
+
+def test_text_plan_leaves_non_hindi_text_unchanged() -> None:
+    plan = indicf5_text_plan(
+        text="Set the API key in an environment variable.",
+        target_language="en",
+    )
+
+    assert plan.tts_text == plan.source_text
+    assert plan.replacement_count == 0
+    assert plan.unmapped_latin_token_count == 0
 
 
 def test_preserves_the_gpu_reproduction_as_one_batch() -> None:

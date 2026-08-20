@@ -15,8 +15,10 @@ from dub_mvp.indicf5_runtime import (
 
 def valid_request(**overrides: object) -> dict[str, object]:
     request = {
-        "schema_version": 3,
-        "target_text": "नमस्ते दुनिया।",
+        "schema_version": 4,
+        "translated_text": "नमस्ते दुनिया।",
+        "tts_text": "नमस्ते दुनिया।",
+        "text_normalization_policy": "hindi_codeswitch_v1",
         "text_batches": ["नमस्ते दुनिया।"],
         "output_path": "/tmp/out.wav",
         "reference_audio": "/tmp/ref.wav",
@@ -45,14 +47,29 @@ def test_read_request_accepts_a_complete_request(tmp_path: Path) -> None:
     assert _read_request(path)["fix_duration_seconds"] == 13.5
 
 
-def test_read_request_rejects_the_legacy_byte_budget_schema(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "field",
+    ["translated_text", "tts_text", "text_normalization_policy"],
+)
+def test_read_request_rejects_empty_text_contract_fields(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    path = tmp_path / "request.json"
+    path.write_text(json.dumps(valid_request(**{field: "  "})), encoding="utf-8")
+
+    with pytest.raises(RuntimeConfigurationError, match=field):
+        _read_request(path)
+
+
+def test_read_request_rejects_the_previous_text_schema(tmp_path: Path) -> None:
     path = tmp_path / "request.json"
     path.write_text(
-        json.dumps(valid_request(schema_version=2, max_chunk_bytes=200)),
+        json.dumps(valid_request(schema_version=3, target_text="नमस्ते दुनिया।")),
         encoding="utf-8",
     )
 
-    with pytest.raises(RuntimeConfigurationError, match="expected version 3"):
+    with pytest.raises(RuntimeConfigurationError, match="expected version 4"):
         _read_request(path)
 
 
@@ -61,7 +78,7 @@ def test_validate_batches_rejects_multiple_batches() -> None:
     # fragment to the whole utterance's window.
     request = valid_request(
         text_batches=["नमस्ते", "दुनिया।"],
-        target_text="नमस्ते दुनिया।",
+        tts_text="नमस्ते दुनिया।",
     )
 
     with pytest.raises(RuntimeConfigurationError, match="exactly one text batch"):
@@ -75,7 +92,7 @@ def test_validate_batches_accepts_one_batch() -> None:
 def test_validate_batches_rejects_altered_text() -> None:
     request = valid_request(text_batches=["नमस्ते"])
 
-    with pytest.raises(RuntimeConfigurationError, match="alter the target text"):
+    with pytest.raises(RuntimeConfigurationError, match="alter the TTS text"):
         _validate_batches(request)
 
 

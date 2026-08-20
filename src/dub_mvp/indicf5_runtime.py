@@ -21,7 +21,9 @@ def _read_request(path: Path) -> dict[str, Any]:
         raise RuntimeConfigurationError("Unable to read IndicF5 request.") from error
     required = {
         "schema_version",
-        "target_text",
+        "translated_text",
+        "tts_text",
+        "text_normalization_policy",
         "text_batches",
         "output_path",
         "reference_audio",
@@ -31,10 +33,15 @@ def _read_request(path: Path) -> dict[str, Any]:
     }
     if not isinstance(request, dict) or not required.issubset(request):
         raise RuntimeConfigurationError("IndicF5 request is missing required fields.")
-    if request["schema_version"] != 3:
+    if request["schema_version"] != 4:
         raise RuntimeConfigurationError(
-            "Unsupported IndicF5 request schema; expected version 3."
+            "Unsupported IndicF5 request schema; expected version 4."
         )
+    for key in ("translated_text", "tts_text", "text_normalization_policy"):
+        if not isinstance(request[key], str) or not request[key].strip():
+            raise RuntimeConfigurationError(
+                f"IndicF5 request contains invalid {key}."
+            )
     return request
 
 
@@ -45,9 +52,9 @@ def _validate_batches(request: dict[str, Any]) -> list[str]:
     if not all(isinstance(batch, str) and batch.strip() for batch in batches):
         raise RuntimeConfigurationError("IndicF5 text batches contain empty text.")
     normalized_batches = [" ".join(batch.split()) for batch in batches]
-    normalized_target = " ".join(str(request["target_text"]).split())
+    normalized_target = " ".join(str(request["tts_text"]).split())
     if " ".join(normalized_batches) != normalized_target:
-        raise RuntimeConfigurationError("IndicF5 text batches alter the target text.")
+        raise RuntimeConfigurationError("IndicF5 text batches alter the TTS text.")
     if len(normalized_batches) != 1:
         # fix_duration is applied per batch, so it only describes the whole
         # utterance while the utterance is a single batch.

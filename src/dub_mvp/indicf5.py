@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unicodedata
 
 from pydantic import BaseModel, Field
@@ -16,6 +17,31 @@ INDICF5_MAX_REFERENCE_SECONDS = 12.0
 INDICF5_MIN_REFERENCE_SECONDS = 3.0
 
 DURATION_POLICY_VERSION = "fixed_timeline_budget_v1"
+TEXT_NORMALIZATION_POLICY_VERSION = "hindi_codeswitch_v1"
+
+# This deliberately starts with only the technical words that failed the
+# Phase 1 listening gate. Broad transliteration would silently guess at names,
+# brands, URLs, and identifiers; add terms only with an evaluation example.
+_HINDI_LATIN_PRONUNCIATIONS: dict[str, str] = {
+    "api": "एपीआई",
+    "deployment": "डिप्लॉयमेंट",
+    "environment": "एनवायरनमेंट",
+    "key": "की",
+    "script": "स्क्रिप्ट",
+    "variable": "वेरिएबल",
+}
+_HINDI_LATIN_TERM = re.compile(
+    r"(?<![A-Za-z0-9._/-])(?:"
+    + "|".join(
+        re.escape(term)
+        for term in sorted(_HINDI_LATIN_PRONUNCIATIONS, key=len, reverse=True)
+    )
+    + r")(?![A-Za-z0-9._/-])",
+    re.IGNORECASE,
+)
+_LATIN_TOKEN = re.compile(
+    r"(?<![A-Za-z])[A-Za-z]+(?:[._/-][A-Za-z]+)*(?![A-Za-z])"
+)
 
 
 class IndicF5ChunkingError(ValueError):
@@ -28,6 +54,32 @@ class IndicF5ReferenceError(ValueError):
 
 class IndicF5DurationError(ValueError):
     """A target duration IndicF5 cannot be asked to fill."""
+
+
+class IndicF5TextPlan(BaseModel):
+    """Versioned provider text derived without changing translated text."""
+
+    policy_version: str
+    target_language: str
+    source_text: str
+    tts_text: str
+    replacement_count: int = Field(ge=0)
+    unmapped_latin_token_count: int = Field(ge=0)
+
+    @property
+    def changed(self) -> bool:
+        return self.source_text != self.tts_text
+
+    def notes(self) -> list[str]:
+        return [
+            f"indicf5_text_normalization_policy={self.policy_version}",
+            f"indicf5_text_normalization_changed={str(self.changed).lower()}",
+            f"indicf5_text_replacement_count={self.replacement_count}",
+            (
+                "indicf5_unmapped_latin_token_count="
+                f"{self.unmapped_latin_token_count}"
+            ),
+        ]
 
 
 # Unicode block starts for every script IndicF5 is trained on, plus Latin.
@@ -74,6 +126,52 @@ def language_script(target_language: str) -> str:
             f"Supported: {', '.join(sorted(_LANGUAGE_SCRIPTS))}."
         )
     return script
+
+
+def indicf5_text_plan(*, text: str, target_language: str) -> IndicF5TextPlan:
+    """Build the exact text IndicF5 should pronounce.
+
+    Translation remains the semantic artifact. This provider-only projection
+    replaces evaluated English technical terms with Devanagari pronunciations
+    for Hindi, because the Phase 1 GPU gate showed that mixed Latin and
+    Devanagari input can collapse into unintelligible speech. Unknown Latin
+    tokens remain unchanged and are counted for review; guessing at arbitrary
+    names or identifiers would be silent semantic corruption.
+    """
+
+    source_text = " ".join(text.split())
+    if not source_text:
+        raise IndicF5ChunkingError("Target text cannot be empty.")
+
+    language_code = target_language.strip().lower().replace("_", "-").split("-")[0]
+    replacement_count = 0
+
+    def replace_term(match: re.Match[str]) -> str:
+        nonlocal replacement_count
+        replacement_count += 1
+        return _HINDI_LATIN_PRONUNCIATIONS[match.group(0).lower()]
+
+    tts_text = (
+        _HINDI_LATIN_TERM.sub(replace_term, source_text)
+        if language_code == "hi"
+        else source_text
+    )
+    return IndicF5TextPlan(
+        policy_version=indicf5_text_normalization_policy_version(),
+        target_language=language_code,
+        source_text=source_text,
+        tts_text=tts_text,
+        replacement_count=replacement_count,
+        unmapped_latin_token_count=(
+            len(_LATIN_TOKEN.findall(tts_text)) if language_code == "hi" else 0
+        ),
+    )
+
+
+def indicf5_text_normalization_policy_version() -> str:
+    """Return the version that must participate in synthesis fingerprints."""
+
+    return TEXT_NORMALIZATION_POLICY_VERSION
 
 
 def character_script(character: str) -> str | None:

@@ -34,15 +34,17 @@ from dub_mvp.duration import (
     build_duration_metrics,
     load_duration_fit_artifact,
 )
-from dub_mvp.localize import LocalizedSegment
 from dub_mvp.indicf5 import (
     IndicF5ChunkingError,
     IndicF5DurationError,
     IndicF5ReferenceError,
     indicf5_duration_plan,
+    indicf5_text_plan,
+    indicf5_text_normalization_policy_version,
     single_text_batch,
     validate_reference_seconds,
 )
+from dub_mvp.localize import LocalizedSegment
 
 LOGGER = logging.getLogger(__name__)
 
@@ -425,14 +427,18 @@ class IndicF5Provider:
         except IndicF5ReferenceError as error:
             raise SynthesisError(f"Unusable IndicF5 reference: {error}") from error
         try:
-            batches = single_text_batch(segment.target_text)
+            text_plan = indicf5_text_plan(
+                text=segment.target_text,
+                target_language=target_language,
+            )
+            batches = single_text_batch(text_plan.tts_text)
         except IndicF5ChunkingError as error:
             raise SynthesisError(f"Unsafe IndicF5 text chunking: {error}") from error
         try:
             duration_plan = indicf5_duration_plan(
                 reference_text=voice_reference.reference_text,
                 reference_seconds=reference_seconds,
-                target_text=segment.target_text,
+                target_text=text_plan.tts_text,
                 target_duration_ms=segment.duration_budget_ms,
             )
         except (IndicF5DurationError, IndicF5ReferenceError) as error:
@@ -452,10 +458,12 @@ class IndicF5Provider:
         request_path = output_path.with_name(f".{output_path.name}.indicf5-request.json")
         response_path = output_path.with_name(f".{output_path.name}.indicf5-response.json")
         request = {
-            "schema_version": 3,
+            "schema_version": 4,
             "model": self.model_name,
             "target_language": target_language,
-            "target_text": segment.target_text,
+            "translated_text": segment.target_text,
+            "tts_text": text_plan.tts_text,
+            "text_normalization_policy": text_plan.policy_version,
             "text_batches": batches,
             "output_path": str(output_path.resolve()),
             "reference_audio": str(reference_audio.resolve()),
@@ -531,6 +539,7 @@ class IndicF5Provider:
             notes=[
                 "indicf5_chunk_policy=single_batch_v1",
                 f"indicf5_batch_count={len(batches)}",
+                *text_plan.notes(),
                 *duration_plan.notes(),
             ],
         )
@@ -614,6 +623,7 @@ class SynthesisPipeline:
             "provider": self._provider.provider_name,
             "model": self._provider.model_name,
             "voice_map_sha256": sha256_file(voice_map_path),
+            **_provider_synthesis_configuration(self._provider.provider_name),
             "duration_correction": (
                 self.duration_corrector.configuration_fingerprint
             ),
@@ -1166,6 +1176,7 @@ def synthesis_outputs_reusable(
             "provider": provider_name,
             "model": model_name,
             "voice_map_sha256": sha256_file(voice_map_path),
+            **_provider_synthesis_configuration(provider_name),
         }
         aggregate_metadata_path = Path(outputs["synthesized_segments_metadata"])
         aggregate_metadata = ArtifactMetadata.model_validate_json(
@@ -1805,7 +1816,7 @@ def _utterance_inputs(
     provider_name: str,
     model_name: str,
 ) -> dict[str, Any]:
-    return {
+    inputs = {
         "utterance": segment.model_dump(mode="json"),
         "speaker_id": _speaker_identity(segment.speaker_id),
         "voice": _voice_descriptor(voice),
@@ -1813,6 +1824,26 @@ def _utterance_inputs(
         "provider": provider_name,
         "model": model_name,
     }
+    if provider_name == "indicf5":
+        text_plan = indicf5_text_plan(
+            text=segment.target_text,
+            target_language=target_language,
+        )
+        inputs["provider_text"] = {
+            "normalization_policy": text_plan.policy_version,
+            "tts_text": text_plan.tts_text,
+        }
+    return inputs
+
+
+def _provider_synthesis_configuration(provider_name: str) -> dict[str, str]:
+    if provider_name == "indicf5":
+        return {
+            "text_normalization_policy": (
+                indicf5_text_normalization_policy_version()
+            ),
+        }
+    return {}
 
 
 def _voice_descriptor(voice: VoiceReference) -> dict[str, Any]:

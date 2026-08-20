@@ -21,6 +21,7 @@ Outputs land in ``voices/samples/phase1/`` with a scoring sheet to fill in.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -32,6 +33,7 @@ from pathlib import Path
 from dub_mvp.indicf5 import (
     INDICF5_MAX_REFERENCE_SECONDS,
     IndicF5ReferenceError,
+    indicf5_text_plan,
     validate_reference_seconds,
 )
 from dub_mvp.localize import LocalizedSegment
@@ -121,7 +123,7 @@ def trim_reference() -> None:
     )
 
 
-def main() -> int:
+def main(*, case_name: str | None = None) -> int:
     if not SOURCE_REFERENCE.is_file():
         raise SystemExit(f"Missing reference audio: {SOURCE_REFERENCE}")
     if not os.environ.get("VIDEO_TRANSLATOR_INDICF5_PYTHON"):
@@ -145,9 +147,21 @@ def main() -> int:
     )
     provider = IndicF5Provider()
 
+    selected_cases = (
+        CASES
+        if case_name is None
+        else [item for item in CASES if item[0] == case_name]
+    )
+    if not selected_cases:
+        raise SystemExit(f"Unknown Phase 1 case: {case_name}")
+
     results = []
-    for name, target_text, budget_ms in CASES:
+    for name, target_text, budget_ms in selected_cases:
         output = OUTPUT_DIRECTORY / f"phase1-{name}.wav"
+        text_plan = indicf5_text_plan(
+            text=target_text,
+            target_language="hi",
+        )
         segment = LocalizedSegment(
             segment_id=f"phase1_{name}",
             start_ms=0,
@@ -172,6 +186,8 @@ def main() -> int:
                 "case": name,
                 "path": str(output.relative_to(EVALUATION)),
                 "target_text": target_text,
+                "tts_text": text_plan.tts_text,
+                "text_normalization_policy": text_plan.policy_version,
                 "target_duration_ms": budget_ms,
                 "measured_duration_ms": measured_ms,
                 "duration_ratio": round(ratio, 4),
@@ -187,7 +203,7 @@ def main() -> int:
         )
 
     sheet = {
-        "schema_version": 1,
+        "schema_version": 2,
         "phase": "1-cross-lingual-quality-gate",
         "reference_audio": str(TRIMMED_REFERENCE.relative_to(EVALUATION)),
         "reference_seconds": round(measured_reference, 3),
@@ -197,7 +213,12 @@ def main() -> int:
         "rubric": RUBRIC,
         "results": results,
     }
-    sheet_path = OUTPUT_DIRECTORY / "phase1-scoring-sheet.json"
+    sheet_name = (
+        "phase1-scoring-sheet.json"
+        if case_name is None
+        else f"phase1-{case_name}-scoring-sheet.json"
+    )
+    sheet_path = OUTPUT_DIRECTORY / sheet_name
     sheet_path.write_text(
         json.dumps(sheet, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -218,4 +239,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--case",
+        choices=[name for name, _, _ in CASES],
+        help="Generate one case without replacing the complete scoring sheet.",
+    )
+    arguments = parser.parse_args()
+    raise SystemExit(main(case_name=arguments.case))

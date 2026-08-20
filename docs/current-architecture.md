@@ -4,7 +4,7 @@ Describes the system as it stands. **Update this file in the same change that
 alters the architecture** — a stale architecture doc is worse than none,
 because agents and new contributors trust it.
 
-Last verified: 2026-08-18 (234 tests passing, including process interruption,
+Last verified: 2026-08-20 (284 tests passing, including process interruption,
 real FFmpeg duration correction, full render/decode, killed-mux recovery,
 selective retry, low-disk rejection, and release- and benchmark-readiness
 gates).
@@ -356,6 +356,26 @@ would be an unmeasured heuristic. Measured output duration and the
 duration-correction stage decide acceptance; cross-lingual voice quality is
 decided by listening (`scripts/evaluate-indicf5-crosslingual.py`).
 
+#### IndicF5 provider text normalization
+
+The Phase 1 listening gate passed native-Devanagari Hindi but failed the
+technical case containing Latin `API key`, `environment variable`, and
+`deployment script`. Translation remains the semantic and display artifact;
+`IndicF5Provider` derives a separate pronunciation-only `tts_text` immediately
+before inference. Policy `hindi_codeswitch_v1` converts only those evaluated
+technical terms to Devanagari. It does not guess at unknown Latin names,
+brands, URLs, or identifiers: their count is recorded in synthesis notes for
+review.
+
+The isolated request schema is version 4 and carries both the unchanged target
+text and the provider `tts_text`. The exact `tts_text` and normalization-policy
+version are part of every IndicF5 utterance fingerprint, and the policy version
+is part of the synthesis configuration fingerprint. Changing either therefore
+regenerates affected raw speech instead of reusing audio created under an older
+pronunciation policy. Evaluation can rerun one case with
+`scripts/evaluate-indicf5-crosslingual.py --case technical` without replacing
+the complete scoring sheet.
+
 Before the first provider call, `SynthesisPipeline` deterministically assigns
 speakers to the ordered catalog voices and persists a verified
 `SpeakerVoiceMap`. Repeated utterances from one speaker therefore always use
@@ -374,11 +394,12 @@ the first provider call instead, which is what a benchmark run should do.
 Each localized utterance owns an independent fingerprint, attempt history,
 revisioned WAV, structured result, and checksum/fingerprint sidecars. The
 fingerprint includes the utterance text/timing/revision, speaker, chosen voice
-audio checksum, target language, provider, and model. Restarting synthesis
-reuses each valid utterance independently and calls the provider only for
-missing, failed, stale, or corrupt work. Forced and regenerated speech always
-uses a new revision; a process-death test verifies that completed utterances
-survive when the next provider call terminates the process.
+audio checksum, target language, provider, and model. IndicF5 fingerprints also
+include its exact provider text and text-normalization policy. Restarting
+synthesis reuses each valid utterance independently and calls the provider only
+for missing, failed, stale, or corrupt work. Forced and regenerated speech
+always uses a new revision; a process-death test verifies that completed
+utterances survive when the next provider call terminates the process.
 
 Provider output is first written to a temporary WAV, decoded and fsynced, then
 atomically promoted. Empty, missing, unreadable, invalid, checksum-mismatched,
@@ -547,6 +568,10 @@ changed stage evidence, artifacts, configuration, or human review does.
 
 ## Known gaps
 
+- IndicF5 Hindi code-switch normalization currently covers only the six Latin
+  technical tokens proven by the Phase 1 evaluation. Unknown Latin tokens are
+  measured and left unchanged; broader pronunciation handling needs its own
+  evaluated term set before the lexicon expands.
 - `cli.py` still holds a manifest across pipeline execution (the pattern fixed
   in `runner.py`). Safe only because nothing else writes during a CLI run; it
   will conflict if an operator runs a stage while a worker holds a lease.

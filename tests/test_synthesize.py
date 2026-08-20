@@ -90,7 +90,7 @@ def write_wav(path: Path, duration_ms: int, *, frame_rate: int = 1000) -> None:
         handle.writeframes(b"\x00\x00" * frames)
 
 
-def test_indicf5_provider_runs_isolated_runtime_with_balanced_batches(
+def test_indicf5_provider_runs_isolated_runtime_with_normalized_single_batch(
     tmp_path: Path,
 ) -> None:
     runtime = tmp_path / "fake_indicf5_runtime.py"
@@ -120,7 +120,14 @@ Path(sys.argv[2]).write_text(json.dumps({"duration_ms": 3200, "seed": 42}))
         runtime_python=sys.executable,
         runtime_script=runtime,
     )
-    segment = load_localized_segments(LOCALIZED)[0]
+    segment = load_localized_segments(LOCALIZED)[0].model_copy(
+        update={
+            "target_text": (
+                "पहले आप API key को environment variable में डालिए, फिर "
+                "deployment script चलाइए।"
+            )
+        }
+    )
     voice_reference = VoiceReference(
         reference_id="approved-reference",
         path=str(reference_audio),
@@ -140,6 +147,8 @@ Path(sys.argv[2]).write_text(json.dumps({"duration_ms": 3200, "seed": 42}))
     assert result.seed == 42
     assert "indicf5_chunk_policy=single_batch_v1" in result.notes
     assert "indicf5_duration_policy=fixed_timeline_budget_v1" in result.notes
+    assert "indicf5_text_normalization_policy=hindi_codeswitch_v1" in result.notes
+    assert "indicf5_text_normalization_changed=true" in result.notes
     assert not list(tmp_path.glob("*.indicf5-*.json"))
 
     request = json.loads((tmp_path / "captured-request.json").read_text())
@@ -148,7 +157,14 @@ Path(sys.argv[2]).write_text(json.dumps({"duration_ms": 3200, "seed": 42}))
     assert request["target_duration_ms"] == segment.duration_budget_ms
     assert request["reference_seconds"] == pytest.approx(9.0)
     assert request["fix_duration_seconds"] == pytest.approx(12.28)
-    assert request["schema_version"] == 3
+    assert request["schema_version"] == 4
+    assert request["translated_text"] == segment.target_text
+    assert request["tts_text"] == (
+        "पहले आप एपीआई की को एनवायरनमेंट वेरिएबल में डालिए, फिर "
+        "डिप्लॉयमेंट स्क्रिप्ट चलाइए।"
+    )
+    assert request["text_batches"] == [request["tts_text"]]
+    assert request["text_normalization_policy"] == "hindi_codeswitch_v1"
     assert "max_chunk_bytes" not in request
 
 
@@ -535,6 +551,48 @@ def test_pipeline_reuses_verified_utterances_without_provider_calls(
         len(json.loads(path.read_text(encoding="utf-8"))) == 1
         for path in duration_histories
     )
+
+
+def test_indicf5_text_policy_change_invalidates_raw_speech(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    localized_path = tmp_path / "localized.json"
+    localized_path.write_text(LOCALIZED.read_text(encoding="utf-8"))
+    first_provider = FixtureSpeechProvider(provider_name="indicf5")
+    first, first_outputs, _ = SynthesisPipeline(provider=first_provider).run(
+        localized_segments_path=localized_path,
+        run_directory=tmp_path,
+        target_language="hi",
+        voice_reference_path=VOICE_REFERENCE,
+    )
+
+    monkeypatch.setattr(
+        "dub_mvp.indicf5.TEXT_NORMALIZATION_POLICY_VERSION",
+        "hindi_codeswitch_v2",
+    )
+    assert not synthesis_outputs_reusable(
+        outputs=first_outputs,
+        localized_segments_path=localized_path,
+        voice_reference_path=VOICE_REFERENCE,
+        run_directory=tmp_path,
+        target_language="hi",
+        provider_name="indicf5",
+        model_name="fixture-indicf5",
+    )
+
+    resumed_provider = FixtureSpeechProvider(provider_name="indicf5")
+    regenerated, _, _ = SynthesisPipeline(provider=resumed_provider).run(
+        localized_segments_path=localized_path,
+        run_directory=tmp_path,
+        target_language="hi",
+        voice_reference_path=VOICE_REFERENCE,
+    )
+
+    assert len(resumed_provider.calls) == 2
+    assert [item.original_tts_audio_path for item in regenerated] != [
+        item.original_tts_audio_path for item in first
+    ]
 
 
 def test_pipeline_rebuilds_corrupt_duration_fit_without_repeating_raw_tts(
