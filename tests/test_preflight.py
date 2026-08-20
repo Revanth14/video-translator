@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 from dub_mvp.cli import app
 from dub_mvp.manifest import MediaMetadata, RunManifest
 from dub_mvp.preflight import (
+    INDICF5_RUNTIME_CHECK_TIMEOUT_SECONDS,
     PreflightCheck,
     PreflightProfile,
     _indicf5_runtime_check,
@@ -73,6 +74,7 @@ def test_indicf5_preflight_checks_the_audio_decoder_runtime(
     def run(arguments, **kwargs):
         captured["arguments"] = arguments
         captured["environment"] = kwargs["env"]
+        captured["timeout"] = kwargs["timeout"]
         return SimpleNamespace(returncode=0, stdout="Tesla T4\n", stderr="")
 
     monkeypatch.setattr("dub_mvp.preflight.subprocess.run", run)
@@ -86,6 +88,8 @@ def test_indicf5_preflight_checks_the_audio_decoder_runtime(
     environment = captured["environment"]
     assert isinstance(environment, dict)
     assert environment["HF_HUB_OFFLINE"] == "1"
+    assert captured["timeout"] == INDICF5_RUNTIME_CHECK_TIMEOUT_SECONDS
+    assert INDICF5_RUNTIME_CHECK_TIMEOUT_SECONDS == 300
 
 
 def test_preflight_reports_missing_required_tools(monkeypatch) -> None:

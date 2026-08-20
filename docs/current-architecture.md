@@ -448,6 +448,13 @@ latency. A media inventory and child-process check passed afterward. The
 validation instance was terminated, its one-time Spot request was cancelled,
 and the Region again had zero pending or running Spot instances.
 
+The benchmark preflight's isolated IndicF5 import is bounded at five minutes.
+Its former 30-second bound rejected the first real long-form worker because a
+healthy cold EBS snapshot was still hydrating Torch/TorchCodec blocks. Five
+minutes is derived from the measured 259.14-second full cache read rather than
+an assumption; a runtime that remains unavailable beyond it still fails the
+spending gate.
+
 IndicF5 raw-speech and synthesis-configuration fingerprints include the model
 revision, runtime protocol and implementation revision,
 `fixed_timeline_budget_v1`, `single_batch_v1`, the text-normalization policy,

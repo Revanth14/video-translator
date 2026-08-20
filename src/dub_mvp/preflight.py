@@ -28,6 +28,12 @@ from dub_mvp.storage import measure_stage_capacity
 
 MINIMUM_BENCHMARK_DURATION_SECONDS = 30 * 60
 MAXIMUM_BENCHMARK_DURATION_SECONDS = 45 * 60
+# A fresh EBS-backed GPU image needed 259 seconds to read/verify the qualified
+# model cache during the real AMI boot gate. Importing Torch/TorchCodec touches
+# some of the same lazily restored blocks, so a 30-second subprocess timeout
+# rejected a healthy cold worker. Keep the check bounded, but give first-read
+# hydration enough room to finish.
+INDICF5_RUNTIME_CHECK_TIMEOUT_SECONDS = 5 * 60
 
 
 class PreflightProfile(str, Enum):
@@ -202,7 +208,7 @@ def _indicf5_runtime_check(*, required: bool) -> PreflightCheck:
             check=False,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=INDICF5_RUNTIME_CHECK_TIMEOUT_SECONDS,
             env=environment,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
