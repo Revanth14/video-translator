@@ -123,6 +123,57 @@ def trim_reference() -> None:
     )
 
 
+def evaluate_case(
+    provider: IndicF5Provider,
+    voice_reference: VoiceReference,
+    case: tuple[str, str, int],
+) -> dict[str, object]:
+    name, target_text, budget_ms = case
+    output = OUTPUT_DIRECTORY / f"phase1-{name}.wav"
+    text_plan = indicf5_text_plan(
+        text=target_text,
+        target_language="hi",
+    )
+    segment = LocalizedSegment(
+        segment_id=f"phase1_{name}",
+        start_ms=0,
+        end_ms=budget_ms,
+        duration_budget_ms=budget_ms,
+        source_text=f"Phase 1 {name} case.",
+        target_text=target_text,
+    )
+    started = time.monotonic()
+    result = provider.synthesize(
+        segment,
+        output_path=output,
+        voice_reference=voice_reference,
+        target_language="hi",
+        revision=1,
+    )
+    elapsed = time.monotonic() - started
+    measured_ms = round(wav_seconds(output) * 1000)
+    ratio = measured_ms / budget_ms
+    evaluated: dict[str, object] = {
+        "case": name,
+        "path": str(output.relative_to(EVALUATION)),
+        "target_text": target_text,
+        "tts_text": text_plan.tts_text,
+        "text_normalization_policy": text_plan.policy_version,
+        "target_duration_ms": budget_ms,
+        "measured_duration_ms": measured_ms,
+        "duration_ratio": round(ratio, 4),
+        "within_hard_gate": abs(ratio - 1.0) <= HARD_RATIO_TOLERANCE,
+        "elapsed_seconds": round(elapsed, 2),
+        "notes": result.notes,
+        "scores": dict.fromkeys(RUBRIC),
+    }
+    print(
+        f"{name:12s} target {budget_ms:6d}ms  measured {measured_ms:6d}ms  "
+        f"ratio {ratio:.2f}  {elapsed:.1f}s"
+    )
+    return evaluated
+
+
 def main(*, case_name: str | None = None) -> int:
     if not SOURCE_REFERENCE.is_file():
         raise SystemExit(f"Missing reference audio: {SOURCE_REFERENCE}")
@@ -155,52 +206,14 @@ def main(*, case_name: str | None = None) -> int:
     if not selected_cases:
         raise SystemExit(f"Unknown Phase 1 case: {case_name}")
 
-    results = []
-    for name, target_text, budget_ms in selected_cases:
-        output = OUTPUT_DIRECTORY / f"phase1-{name}.wav"
-        text_plan = indicf5_text_plan(
-            text=target_text,
-            target_language="hi",
-        )
-        segment = LocalizedSegment(
-            segment_id=f"phase1_{name}",
-            start_ms=0,
-            end_ms=budget_ms,
-            duration_budget_ms=budget_ms,
-            source_text=f"Phase 1 {name} case.",
-            target_text=target_text,
-        )
-        started = time.monotonic()
-        result = provider.synthesize(
-            segment,
-            output_path=output,
-            voice_reference=voice_reference,
-            target_language="hi",
-            revision=1,
-        )
-        elapsed = time.monotonic() - started
-        measured_ms = round(wav_seconds(output) * 1000)
-        ratio = measured_ms / budget_ms
-        results.append(
-            {
-                "case": name,
-                "path": str(output.relative_to(EVALUATION)),
-                "target_text": target_text,
-                "tts_text": text_plan.tts_text,
-                "text_normalization_policy": text_plan.policy_version,
-                "target_duration_ms": budget_ms,
-                "measured_duration_ms": measured_ms,
-                "duration_ratio": round(ratio, 4),
-                "within_hard_gate": abs(ratio - 1.0) <= HARD_RATIO_TOLERANCE,
-                "elapsed_seconds": round(elapsed, 2),
-                "notes": result.notes,
-                "scores": dict.fromkeys(RUBRIC),
-            }
-        )
-        print(
-            f"{name:12s} target {budget_ms:6d}ms  measured {measured_ms:6d}ms  "
-            f"ratio {ratio:.2f}  {elapsed:.1f}s"
-        )
+    provider.start_stage()
+    try:
+        results = [
+            evaluate_case(provider, voice_reference, case)
+            for case in selected_cases
+        ]
+    finally:
+        provider.close_stage()
 
     sheet = {
         "schema_version": 2,

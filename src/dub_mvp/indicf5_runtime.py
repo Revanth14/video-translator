@@ -6,8 +6,16 @@ import os
 import sys
 import traceback
 import wave
+from contextlib import redirect_stdout
+from dataclasses import dataclass
 from pathlib import Path
+from textwrap import shorten
 from typing import Any
+
+
+RUNTIME_PROTOCOL_VERSION = "stage_ndjson_v1"
+RUNTIME_IMPLEMENTATION_REVISION = "indicf5_runtime_v5"
+REQUEST_SCHEMA_VERSION = 5
 
 
 class RuntimeConfigurationError(RuntimeError):
@@ -19,8 +27,18 @@ def _read_request(path: Path) -> dict[str, Any]:
         request = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError) as error:
         raise RuntimeConfigurationError("Unable to read IndicF5 request.") from error
+    return _validate_request(request)
+
+
+def _validate_request(
+    request: Any,
+    *,
+    require_request_id: bool = False,
+) -> dict[str, Any]:
     required = {
         "schema_version",
+        "model",
+        "model_revision",
         "translated_text",
         "tts_text",
         "text_normalization_policy",
@@ -31,17 +49,33 @@ def _read_request(path: Path) -> dict[str, Any]:
         "reference_seconds",
         "fix_duration_seconds",
     }
+    if require_request_id:
+        required.add("request_id")
     if not isinstance(request, dict) or not required.issubset(request):
         raise RuntimeConfigurationError("IndicF5 request is missing required fields.")
-    if request["schema_version"] != 4:
+    if request["schema_version"] != REQUEST_SCHEMA_VERSION:
         raise RuntimeConfigurationError(
-            "Unsupported IndicF5 request schema; expected version 4."
+            "Unsupported IndicF5 request schema; expected version "
+            f"{REQUEST_SCHEMA_VERSION}."
         )
-    for key in ("translated_text", "tts_text", "text_normalization_policy"):
+    for key in (
+        "model",
+        "model_revision",
+        "translated_text",
+        "tts_text",
+        "text_normalization_policy",
+    ):
         if not isinstance(request[key], str) or not request[key].strip():
             raise RuntimeConfigurationError(
                 f"IndicF5 request contains invalid {key}."
             )
+    if require_request_id and (
+        not isinstance(request["request_id"], str)
+        or not request["request_id"].strip()
+    ):
+        raise RuntimeConfigurationError(
+            "IndicF5 request contains invalid request_id."
+        )
     return request
 
 
@@ -86,7 +120,19 @@ def _positive_float(request: dict[str, Any], key: str) -> float:
     return value
 
 
-def _synthesize(request: dict[str, Any]) -> dict[str, Any]:
+@dataclass(frozen=True)
+class _LoadedRuntime:
+    np: Any
+    sf: Any
+    torchaudio: Any
+    infer_batch_process: Any
+    preprocess_ref_audio_text: Any
+    model: Any
+
+
+def _load_runtime() -> _LoadedRuntime:
+    """Load and compile the expensive model once for this child process."""
+
     try:
         import inspect
 
@@ -126,20 +172,6 @@ def _synthesize(request: dict[str, Any]) -> dict[str, Any]:
         if not path.exists():
             raise RuntimeConfigurationError(f"IndicF5 artifact is missing: {path}")
 
-    reference_audio = Path(str(request["reference_audio"]))
-    output_path = Path(str(request["output_path"]))
-    if not reference_audio.is_file():
-        raise RuntimeConfigurationError(
-            f"IndicF5 reference audio is missing: {reference_audio}"
-        )
-    batches = _validate_batches(request)
-    expected_reference_seconds = _positive_float(request, "reference_seconds")
-    fix_duration_seconds = _positive_float(request, "fix_duration_seconds")
-    if fix_duration_seconds <= expected_reference_seconds:
-        raise RuntimeConfigurationError(
-            "IndicF5 fix_duration_seconds must exceed the reference duration; "
-            "it describes the whole reference-plus-generated window."
-        )
     if "fix_duration" not in inspect.signature(infer_batch_process).parameters:
         raise RuntimeConfigurationError(
             "The installed f5_tts does not accept fix_duration. Without it "
@@ -194,10 +226,42 @@ def _synthesize(request: dict[str, Any]) -> dict[str, Any]:
     del state
     gc.collect()
 
-    ref_audio, normalized_reference_text = preprocess_ref_audio_text(
+    return _LoadedRuntime(
+        np=np,
+        sf=sf,
+        torchaudio=torchaudio,
+        infer_batch_process=infer_batch_process,
+        preprocess_ref_audio_text=preprocess_ref_audio_text,
+        model=model,
+    )
+
+
+def _synthesize(
+    request: dict[str, Any],
+    *,
+    runtime: _LoadedRuntime | None = None,
+) -> dict[str, Any]:
+    runtime = runtime or _load_runtime()
+
+    reference_audio = Path(str(request["reference_audio"]))
+    output_path = Path(str(request["output_path"]))
+    if not reference_audio.is_file():
+        raise RuntimeConfigurationError(
+            f"IndicF5 reference audio is missing: {reference_audio}"
+        )
+    batches = _validate_batches(request)
+    expected_reference_seconds = _positive_float(request, "reference_seconds")
+    fix_duration_seconds = _positive_float(request, "fix_duration_seconds")
+    if fix_duration_seconds <= expected_reference_seconds:
+        raise RuntimeConfigurationError(
+            "IndicF5 fix_duration_seconds must exceed the reference duration; "
+            "it describes the whole reference-plus-generated window."
+        )
+
+    ref_audio, normalized_reference_text = runtime.preprocess_ref_audio_text(
         str(reference_audio), str(request["reference_text"])
     )
-    reference_waveform, reference_sample_rate = torchaudio.load(ref_audio)
+    reference_waveform, reference_sample_rate = runtime.torchaudio.load(ref_audio)
     # Preprocessing trims edge silence and clips over-long clips, so the length
     # the caller budgeted against is not necessarily the one the model is
     # prompted with. Small shifts are absorbed by the arithmetic below. A large
@@ -215,12 +279,12 @@ def _synthesize(request: dict[str, Any]) -> dict[str, Any]:
     # sliced back off, so restate it against the reference actually loaded to
     # keep the generated portion equal to the caller's timeline budget.
     target_seconds = fix_duration_seconds - expected_reference_seconds
-    audio, sample_rate, _ = infer_batch_process(
+    audio, sample_rate, _ = runtime.infer_batch_process(
         (reference_waveform, reference_sample_rate),
         normalized_reference_text,
         batches,
-        model.ema_model,
-        model.vocoder,
+        runtime.model.ema_model,
+        runtime.model.vocoder,
         mel_spec_type="vocos",
         speed=1.0,
         fix_duration=actual_reference_seconds + target_seconds,
@@ -229,9 +293,9 @@ def _synthesize(request: dict[str, Any]) -> dict[str, Any]:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(f".{output_path.name}.tmp")
-    sf.write(
+    runtime.sf.write(
         str(temporary),
-        np.asarray(audio, dtype=np.float32),
+        runtime.np.asarray(audio, dtype=runtime.np.float32),
         sample_rate,
         format="WAV",
     )
@@ -261,9 +325,141 @@ def _synthesize(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _emit_protocol(payload: dict[str, Any], output_stream: Any) -> None:
+    output_stream.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+    output_stream.write("\n")
+    output_stream.flush()
+
+
+def _error_detail(error: BaseException) -> str:
+    detail = " ".join(str(error).split()) or type(error).__name__
+    return shorten(detail, width=1000, placeholder="...")
+
+
+def _serve(
+    *,
+    input_stream: Any = None,
+    output_stream: Any = None,
+    runtime_loader: Any = None,
+    synthesizer: Any = None,
+) -> int:
+    """Serve sequential correlated requests while keeping one model loaded."""
+
+    input_stream = input_stream or sys.stdin
+    output_stream = output_stream or sys.stdout
+    runtime_loader = runtime_loader or _load_runtime
+    synthesizer = synthesizer or _synthesize
+    try:
+        # Provider libraries are not part of the protocol. Anything they print
+        # belongs on stderr so stdout remains strict newline-delimited JSON.
+        with redirect_stdout(sys.stderr):
+            runtime = runtime_loader()
+    except RuntimeConfigurationError as error:
+        _emit_protocol(
+            {
+                "type": "ready",
+                "status": "failed",
+                "protocol_version": RUNTIME_PROTOCOL_VERSION,
+                "runtime_revision": RUNTIME_IMPLEMENTATION_REVISION,
+                "retryable": False,
+                "error_class": type(error).__name__,
+                "error": _error_detail(error),
+            },
+            output_stream,
+        )
+        return 2
+    except BaseException as error:
+        traceback.print_exc(file=sys.stderr)
+        _emit_protocol(
+            {
+                "type": "ready",
+                "status": "failed",
+                "protocol_version": RUNTIME_PROTOCOL_VERSION,
+                "runtime_revision": RUNTIME_IMPLEMENTATION_REVISION,
+                "retryable": True,
+                "error_class": type(error).__name__,
+                "error": _error_detail(error),
+            },
+            output_stream,
+        )
+        return 1
+
+    _emit_protocol(
+        {
+            "type": "ready",
+            "status": "ready",
+            "protocol_version": RUNTIME_PROTOCOL_VERSION,
+            "runtime_revision": RUNTIME_IMPLEMENTATION_REVISION,
+            "request_schema_version": REQUEST_SCHEMA_VERSION,
+        },
+        output_stream,
+    )
+    seen_request_ids: set[str] = set()
+    for line in input_stream:
+        if not line.strip():
+            continue
+        request_id: str | None = None
+        try:
+            try:
+                request = json.loads(line)
+            except (ValueError, TypeError) as error:
+                raise RuntimeConfigurationError(
+                    "IndicF5 protocol request is not valid JSON."
+                ) from error
+            validated = _validate_request(request, require_request_id=True)
+            request_id = validated["request_id"]
+            if request_id in seen_request_ids:
+                raise RuntimeConfigurationError(
+                    f"IndicF5 request_id was reused: {request_id}."
+                )
+            seen_request_ids.add(request_id)
+            with redirect_stdout(sys.stderr):
+                response = synthesizer(validated, runtime=runtime)
+            _emit_protocol(
+                {
+                    **response,
+                    "type": "response",
+                    "request_id": request_id,
+                    "status": "completed",
+                },
+                output_stream,
+            )
+        except RuntimeConfigurationError as error:
+            _emit_protocol(
+                {
+                    "type": "response",
+                    "request_id": request_id,
+                    "status": "failed",
+                    "retryable": False,
+                    "error_class": type(error).__name__,
+                    "error": _error_detail(error),
+                },
+                output_stream,
+            )
+        except BaseException as error:
+            traceback.print_exc(file=sys.stderr)
+            _emit_protocol(
+                {
+                    "type": "response",
+                    "request_id": request_id,
+                    "status": "failed",
+                    "retryable": True,
+                    "error_class": type(error).__name__,
+                    "error": _error_detail(error),
+                },
+                output_stream,
+            )
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1:] == ["--serve"]:
+        return _serve()
     if len(sys.argv) != 3:
-        print("usage: indicf5_runtime.py REQUEST RESPONSE", file=sys.stderr)
+        print(
+            "usage: indicf5_runtime.py --serve | REQUEST RESPONSE",
+            file=sys.stderr,
+        )
         return 2
     request_path = Path(sys.argv[1])
     response_path = Path(sys.argv[2])

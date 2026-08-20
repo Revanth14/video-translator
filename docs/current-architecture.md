@@ -4,7 +4,7 @@ Describes the system as it stands. **Update this file in the same change that
 alters the architecture** — a stale architecture doc is worse than none,
 because agents and new contributors trust it.
 
-Last verified: 2026-08-20 (284 tests passing, including process interruption,
+Last verified: 2026-08-20 (293 tests passing, including process interruption,
 real FFmpeg duration correction, full render/decode, killed-mux recovery,
 selective retry, low-disk rejection, and release- and benchmark-readiness
 gates).
@@ -367,12 +367,10 @@ technical terms to Devanagari. It does not guess at unknown Latin names,
 brands, URLs, or identifiers: their count is recorded in synthesis notes for
 review.
 
-The isolated request schema is version 4 and carries both the unchanged target
-text and the provider `tts_text`. The exact `tts_text` and normalization-policy
-version are part of every IndicF5 utterance fingerprint, and the policy version
-is part of the synthesis configuration fingerprint. Changing either therefore
-regenerates affected raw speech instead of reusing audio created under an older
-pronunciation policy. Evaluation can rerun one case with
+The isolated request schema is version 5 and carries both the unchanged target
+text and the provider `tts_text`, plus an explicit request ID and model
+revision. The exact `tts_text` and normalization-policy version are part of
+every IndicF5 utterance fingerprint. Evaluation can rerun one case with
 `scripts/evaluate-indicf5-crosslingual.py --case technical` without replacing
 the complete scoring sheet.
 
@@ -384,6 +382,33 @@ confirmed intelligibility of at least 4/5, acceptable voice similarity, no
 severe filler or hallucination, and no clipped words. The consented audio and
 checksum-verified review record remain under ignored `evaluation/`; they are
 not source-controlled artifacts.
+
+#### IndicF5 stage runtime
+
+One `IndicF5Provider` child process belongs to one synthesis-stage execution.
+The provider starts `indicf5_runtime.py --serve`, and the child loads and
+compiles the model once before emitting its readiness record. Requests and
+correlated responses are sequential NDJSON on stdin/stdout; every utterance
+has a unique request ID. Provider/library output is redirected to stderr, which
+the parent drains continuously on a dedicated thread so a full diagnostics
+pipe cannot deadlock generation.
+
+Stage cleanup runs in `finally`: close stdin, wait briefly, terminate, then kill
+after another bounded wait. Cleanup errors are logged and cannot replace the
+stage error being recorded. Unexpected child exit, malformed protocol output,
+and timeout are retryable provider failures; missing models, incompatible
+protocol/schema revisions, and invalid requests are permanent. A real child-
+process test kills the runtime after the first completed utterance and proves
+that the next stage attempt starts a new runtime, reuses the verified first WAV,
+and requests only the unfinished utterance.
+
+IndicF5 raw-speech and synthesis-configuration fingerprints include the model
+revision, runtime protocol and implementation revision,
+`fixed_timeline_budget_v1`, `single_batch_v1`, the text-normalization policy,
+`configured_voice_catalog_v1`, and `preexisting_reference_audio_v1`. Changing
+any of those generation inputs invalidates old speech proof. Runtime-script
+paths and timestamps are deliberately excluded: a deployment path change does
+not change audio semantics, while the explicit implementation revision does.
 
 Before the first provider call, `SynthesisPipeline` deterministically assigns
 speakers to the ordered catalog voices and persists a verified
@@ -404,9 +429,9 @@ Each localized utterance owns an independent fingerprint, attempt history,
 revisioned WAV, structured result, and checksum/fingerprint sidecars. The
 fingerprint includes the utterance text/timing/revision, speaker, chosen voice
 audio checksum, target language, provider, and model. IndicF5 fingerprints also
-include its exact provider text and text-normalization policy. Restarting
-synthesis reuses each valid utterance independently and calls the provider only
-for missing, failed, stale, or corrupt work. Forced and regenerated speech
+include its exact provider text and the complete generation-policy set above.
+Restarting synthesis reuses each valid utterance independently and calls the
+provider only for missing, failed, stale, or corrupt work. Forced and regenerated speech
 always uses a new revision; a process-death test verifies that completed
 utterances survive when the next provider call terminates the process.
 
@@ -581,6 +606,11 @@ changed stage evidence, artifacts, configuration, or human review does.
   technical tokens proven by the Phase 1 evaluation. Unknown Latin tokens are
   measured and left unchanged; broader pronunciation handling needs its own
   evaluated term set before the lexicon expands.
+- The stage-scoped IndicF5 protocol, stderr drain, child-death recovery, and
+  single-load contract are exercised with real local child processes, but the
+  GPU host was terminated before Phase 2. A qualified GPU run must still
+  measure actual model loads, first-utterance latency, warm-utterance latency,
+  VRAM, and shutdown behavior before the runtime gate is considered passed.
 - `cli.py` still holds a manifest across pipeline execution (the pattern fixed
   in `runner.py`). Safe only because nothing else writes during a CLI run; it
   will conflict if an operator runs a stage while a worker holds a lease.

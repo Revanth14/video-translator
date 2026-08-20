@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 import wave
 from multiprocessing import Process
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+from dub_mvp import indicf5_runtime
 from dub_mvp.artifacts import ArtifactMetadata
 from dub_mvp.cli import app
 from dub_mvp.duration import DurationCorrectionError, DurationCorrector, DurationPolicy
@@ -90,29 +92,120 @@ def write_wav(path: Path, duration_ms: int, *, frame_rate: int = 1000) -> None:
         handle.writeframes(b"\x00\x00" * frames)
 
 
+def write_fake_indicf5_runtime(
+    path: Path,
+    *,
+    capture_path: Path | None = None,
+    load_marker_path: Path | None = None,
+    die_on_request: int | None = None,
+    stderr_bytes_per_request: int = 0,
+    hang_on_eof: bool = False,
+) -> None:
+    """Write a real NDJSON child process without loading the GPU model."""
+
+    path.write_text(
+        f'''
+import json
+import os
+import signal
+import sys
+import time
+import wave
+from pathlib import Path
+
+CAPTURE = Path({str(capture_path)!r}) if {capture_path is not None!r} else None
+LOAD_MARKER = (
+    Path({str(load_marker_path)!r}) if {load_marker_path is not None!r} else None
+)
+DIE_ON_REQUEST = {die_on_request!r}
+STDERR_BYTES = {stderr_bytes_per_request!r}
+HANG_ON_EOF = {hang_on_eof!r}
+
+if HANG_ON_EOF:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+def emit(payload):
+    print(json.dumps(payload, separators=(",", ":")), flush=True)
+
+if LOAD_MARKER is not None:
+    with LOAD_MARKER.open("a", encoding="utf-8") as handle:
+        handle.write("loaded\\n")
+
+emit({{
+    "type": "ready",
+    "status": "ready",
+    "protocol_version": {indicf5_runtime.RUNTIME_PROTOCOL_VERSION!r},
+    "runtime_revision": {indicf5_runtime.RUNTIME_IMPLEMENTATION_REVISION!r},
+    "request_schema_version": {indicf5_runtime.REQUEST_SCHEMA_VERSION!r},
+}})
+
+for request_number, line in enumerate(sys.stdin, start=1):
+    request = json.loads(line)
+    if CAPTURE is not None:
+        with CAPTURE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(request) + "\\n")
+    if STDERR_BYTES:
+        sys.stderr.write("diagnostic " + "x" * STDERR_BYTES + "\\n")
+        sys.stderr.flush()
+    if DIE_ON_REQUEST == request_number:
+        print("intentional runtime death", file=sys.stderr, flush=True)
+        os._exit(17)
+    output = Path(request["output_path"])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    duration_ms = int(request["target_duration_ms"])
+    frames = duration_ms * 24
+    with wave.open(str(output), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(24000)
+        handle.writeframes(b"\\x00\\x00" * frames)
+    emit({{
+        "type": "response",
+        "request_id": request["request_id"],
+        "status": "completed",
+        "duration_ms": duration_ms,
+        "seed": 42,
+    }})
+
+if HANG_ON_EOF:
+    while True:
+        time.sleep(1)
+''',
+        encoding="utf-8",
+    )
+
+
+def write_indicf5_voice_catalog(tmp_path: Path) -> Path:
+    reference_audio = tmp_path / "reference.wav"
+    write_wav(reference_audio, 9_000, frame_rate=24_000)
+    catalog_path = tmp_path / "voice-catalog.json"
+    catalog_path.write_text(
+        VoiceCatalog(
+            voices=[
+                VoiceReference(
+                    reference_id="approved-reference",
+                    path=str(reference_audio),
+                    reference_text=(
+                        "This is an exact and sufficiently detailed reference "
+                        "transcript."
+                    ),
+                    consent="approved fixture",
+                )
+            ]
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    return catalog_path
+
+
 def test_indicf5_provider_runs_isolated_runtime_with_normalized_single_batch(
     tmp_path: Path,
 ) -> None:
     runtime = tmp_path / "fake_indicf5_runtime.py"
-    runtime.write_text(
-        """
-import json
-import sys
-import wave
-from pathlib import Path
-
-request = json.loads(Path(sys.argv[1]).read_text())
-Path(sys.argv[1]).with_name("captured-request.json").write_text(json.dumps(request))
-output = Path(request["output_path"])
-output.parent.mkdir(parents=True, exist_ok=True)
-with wave.open(str(output), "wb") as handle:
-    handle.setnchannels(1)
-    handle.setsampwidth(2)
-    handle.setframerate(24000)
-    handle.writeframes(b"\\x00\\x00" * 24000)
-Path(sys.argv[2]).write_text(json.dumps({"duration_ms": 3200, "seed": 42}))
-""",
-        encoding="utf-8",
+    captured_request_path = tmp_path / "captured-request.jsonl"
+    write_fake_indicf5_runtime(
+        runtime,
+        capture_path=captured_request_path,
     )
     reference_audio = tmp_path / "reference.wav"
     write_wav(reference_audio, 9_000)
@@ -135,15 +228,16 @@ Path(sys.argv[2]).write_text(json.dumps({"duration_ms": 3200, "seed": 42}))
         consent="approved fixture",
     )
 
-    result = provider.synthesize(
-        segment,
-        output_path=tmp_path / "tts-r1.wav",
-        voice_reference=voice_reference,
-        target_language="hi",
-        revision=1,
-    )
+    with provider:
+        result = provider.synthesize(
+            segment,
+            output_path=tmp_path / "tts-r1.wav",
+            voice_reference=voice_reference,
+            target_language="hi",
+            revision=1,
+        )
 
-    assert result.duration_ms == 3200
+    assert result.duration_ms == segment.duration_budget_ms
     assert result.seed == 42
     assert "indicf5_chunk_policy=single_batch_v1" in result.notes
     assert "indicf5_duration_policy=fixed_timeline_budget_v1" in result.notes
@@ -151,13 +245,15 @@ Path(sys.argv[2]).write_text(json.dumps({"duration_ms": 3200, "seed": 42}))
     assert "indicf5_text_normalization_changed=true" in result.notes
     assert not list(tmp_path.glob("*.indicf5-*.json"))
 
-    request = json.loads((tmp_path / "captured-request.json").read_text())
+    request = json.loads(captured_request_path.read_text())
     # Generation is pinned to reference + timeline budget rather than left to
     # the UTF-8 byte ratio that mistimed the evaluation samples.
     assert request["target_duration_ms"] == segment.duration_budget_ms
     assert request["reference_seconds"] == pytest.approx(9.0)
     assert request["fix_duration_seconds"] == pytest.approx(12.28)
-    assert request["schema_version"] == 4
+    assert request["schema_version"] == 5
+    assert request["request_id"].startswith(f"{segment.segment_id}-r1-q")
+    assert request["model_revision"] == "ai4bharat_indicf5_v1"
     assert request["translated_text"] == segment.target_text
     assert request["tts_text"] == (
         "पहले आप एपीआई की को एनवायरनमेंट वेरिएबल में डालिए, फिर "
@@ -166,6 +262,16 @@ Path(sys.argv[2]).write_text(json.dumps({"duration_ms": 3200, "seed": 42}))
     assert request["text_batches"] == [request["tts_text"]]
     assert request["text_normalization_policy"] == "hindi_codeswitch_v1"
     assert "max_chunk_bytes" not in request
+    assert provider.fingerprint_configuration == {
+        "runtime_protocol": "stage_ndjson_v1",
+        "runtime_revision": "indicf5_runtime_v5",
+        "model_revision": "ai4bharat_indicf5_v1",
+        "duration_policy": "fixed_timeline_budget_v1",
+        "chunk_policy": "single_batch_v1",
+        "text_normalization_policy": "hindi_codeswitch_v1",
+        "reference_selection_policy": "configured_voice_catalog_v1",
+        "reference_extraction_policy": "preexisting_reference_audio_v1",
+    }
 
 
 def test_indicf5_provider_rejects_over_long_reference_audio(tmp_path: Path) -> None:
@@ -201,25 +307,7 @@ def test_indicf5_provider_records_cross_script_prompting(tmp_path: Path) -> None
     once made a cross-script reference harmful never runs.
     """
     runtime = tmp_path / "fake_indicf5_runtime.py"
-    runtime.write_text(
-        """
-import json
-import sys
-import wave
-from pathlib import Path
-
-request = json.loads(Path(sys.argv[1]).read_text())
-output = Path(request["output_path"])
-output.parent.mkdir(parents=True, exist_ok=True)
-with wave.open(str(output), "wb") as handle:
-    handle.setnchannels(1)
-    handle.setsampwidth(2)
-    handle.setframerate(24000)
-    handle.writeframes(b"\\x00\\x00" * 24000)
-Path(sys.argv[2]).write_text(json.dumps({"duration_ms": 3280}))
-""",
-        encoding="utf-8",
-    )
+    write_fake_indicf5_runtime(runtime)
     reference_audio = tmp_path / "reference.wav"
     write_wav(reference_audio, 9_000)
     provider = IndicF5Provider(
@@ -246,13 +334,14 @@ Path(sys.argv[2]).write_text(json.dumps({"duration_ms": 3280}))
         consent="approved fixture",
     )
 
-    result = provider.synthesize(
-        segment,
-        output_path=tmp_path / "tts-r1.wav",
-        voice_reference=voice_reference,
-        target_language="hi",
-        revision=1,
-    )
+    with provider:
+        result = provider.synthesize(
+            segment,
+            output_path=tmp_path / "tts-r1.wav",
+            voice_reference=voice_reference,
+            target_language="hi",
+            revision=1,
+        )
 
     assert "indicf5_scripts_match=false" in result.notes
     assert "indicf5_reference_script=latin" in result.notes
@@ -287,6 +376,139 @@ def test_indicf5_provider_requires_exact_reference_transcript(
             target_language="hi",
             revision=1,
         )
+
+
+def test_indicf5_pipeline_loads_once_and_continuously_drains_stderr(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "fake_indicf5_runtime.py"
+    captured = tmp_path / "captured.jsonl"
+    load_marker = tmp_path / "model-loads.txt"
+    write_fake_indicf5_runtime(
+        runtime,
+        capture_path=captured,
+        load_marker_path=load_marker,
+        # More than a typical pipe buffer: synthesis would deadlock without
+        # the dedicated stderr reader.
+        stderr_bytes_per_request=200_000,
+    )
+    localized_path = tmp_path / "localized.json"
+    localized_path.write_text(LOCALIZED.read_text(encoding="utf-8"))
+    provider = IndicF5Provider(
+        runtime_python=sys.executable,
+        runtime_script=runtime,
+        timeout_seconds=5,
+        shutdown_timeout_seconds=0.2,
+    )
+
+    _, outputs, _ = SynthesisPipeline(provider=provider).run(
+        localized_segments_path=localized_path,
+        run_directory=tmp_path,
+        target_language="hi",
+        voice_reference_path=write_indicf5_voice_catalog(tmp_path),
+    )
+
+    requests = [json.loads(line) for line in captured.read_text().splitlines()]
+    assert load_marker.read_text().splitlines() == ["loaded"]
+    assert len(requests) == 2
+    assert len({request["request_id"] for request in requests}) == 2
+    assert provider._process is None
+    metrics = SynthesisMetrics.model_validate_json(
+        Path(outputs["synthesis_metrics"]).read_text(encoding="utf-8")
+    )
+    assert metrics.provider_calls == 2
+
+
+def test_indicf5_pipeline_runtime_death_is_retryable_and_resume_reuses_first(
+    tmp_path: Path,
+) -> None:
+    dying_runtime = tmp_path / "dying_runtime.py"
+    first_capture = tmp_path / "first-captured.jsonl"
+    first_loads = tmp_path / "first-loads.txt"
+    write_fake_indicf5_runtime(
+        dying_runtime,
+        capture_path=first_capture,
+        load_marker_path=first_loads,
+        die_on_request=2,
+    )
+    localized_path = tmp_path / "localized.json"
+    localized_path.write_text(LOCALIZED.read_text(encoding="utf-8"))
+    catalog_path = write_indicf5_voice_catalog(tmp_path)
+    failing_provider = IndicF5Provider(
+        runtime_python=sys.executable,
+        runtime_script=dying_runtime,
+        timeout_seconds=5,
+        shutdown_timeout_seconds=0.2,
+    )
+
+    with pytest.raises(SpeechProviderError) as caught:
+        SynthesisPipeline(provider=failing_provider).run(
+            localized_segments_path=localized_path,
+            run_directory=tmp_path,
+            target_language="hi",
+            voice_reference_path=catalog_path,
+        )
+
+    assert caught.value.retryable is True
+    assert first_loads.read_text().splitlines() == ["loaded"]
+    assert len(first_capture.read_text().splitlines()) == 2
+
+    healthy_runtime = tmp_path / "healthy_runtime.py"
+    resumed_capture = tmp_path / "resumed-captured.jsonl"
+    resumed_loads = tmp_path / "resumed-loads.txt"
+    write_fake_indicf5_runtime(
+        healthy_runtime,
+        capture_path=resumed_capture,
+        load_marker_path=resumed_loads,
+    )
+    resumed_provider = IndicF5Provider(
+        runtime_python=sys.executable,
+        runtime_script=healthy_runtime,
+        timeout_seconds=5,
+        shutdown_timeout_seconds=0.2,
+    )
+
+    _, outputs, _ = SynthesisPipeline(provider=resumed_provider).run(
+        localized_segments_path=localized_path,
+        run_directory=tmp_path,
+        target_language="hi",
+        voice_reference_path=catalog_path,
+    )
+
+    resumed_requests = [
+        json.loads(line) for line in resumed_capture.read_text().splitlines()
+    ]
+    assert resumed_loads.read_text().splitlines() == ["loaded"]
+    assert len(resumed_requests) == 1
+    assert resumed_requests[0]["request_id"].startswith("seg_0002-")
+    metrics = SynthesisMetrics.model_validate_json(
+        Path(outputs["synthesis_metrics"]).read_text(encoding="utf-8")
+    )
+    assert metrics.reused_utterances == 1
+    assert metrics.provider_calls == 1
+
+
+def test_indicf5_stage_shutdown_escalates_to_kill_after_bounded_wait(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "hanging_runtime.py"
+    write_fake_indicf5_runtime(runtime, hang_on_eof=True)
+    provider = IndicF5Provider(
+        runtime_python=sys.executable,
+        runtime_script=runtime,
+        timeout_seconds=5,
+        shutdown_timeout_seconds=0.05,
+    )
+    provider.start_stage()
+    process = provider._process
+    assert process is not None
+
+    started = time.monotonic()
+    provider.close_stage()
+
+    assert time.monotonic() - started < 1
+    assert process.poll() is not None
+    assert provider._process is None
 
 
 def test_loads_localized_segments_and_voice_reference() -> None:
@@ -570,6 +792,49 @@ def test_indicf5_text_policy_change_invalidates_raw_speech(
     monkeypatch.setattr(
         "dub_mvp.indicf5.TEXT_NORMALIZATION_POLICY_VERSION",
         "hindi_codeswitch_v2",
+    )
+    assert not synthesis_outputs_reusable(
+        outputs=first_outputs,
+        localized_segments_path=localized_path,
+        voice_reference_path=VOICE_REFERENCE,
+        run_directory=tmp_path,
+        target_language="hi",
+        provider_name="indicf5",
+        model_name="fixture-indicf5",
+    )
+
+    resumed_provider = FixtureSpeechProvider(provider_name="indicf5")
+    regenerated, _, _ = SynthesisPipeline(provider=resumed_provider).run(
+        localized_segments_path=localized_path,
+        run_directory=tmp_path,
+        target_language="hi",
+        voice_reference_path=VOICE_REFERENCE,
+    )
+
+    assert len(resumed_provider.calls) == 2
+    assert [item.original_tts_audio_path for item in regenerated] != [
+        item.original_tts_audio_path for item in first
+    ]
+
+
+def test_indicf5_runtime_policy_change_invalidates_raw_speech(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    localized_path = tmp_path / "localized.json"
+    localized_path.write_text(LOCALIZED.read_text(encoding="utf-8"))
+    first_provider = FixtureSpeechProvider(provider_name="indicf5")
+    first, first_outputs, _ = SynthesisPipeline(provider=first_provider).run(
+        localized_segments_path=localized_path,
+        run_directory=tmp_path,
+        target_language="hi",
+        voice_reference_path=VOICE_REFERENCE,
+    )
+
+    monkeypatch.setattr(
+        indicf5_runtime,
+        "RUNTIME_IMPLEMENTATION_REVISION",
+        "indicf5_runtime_v6",
     )
     assert not synthesis_outputs_reusable(
         outputs=first_outputs,

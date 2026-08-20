@@ -17,6 +17,7 @@ INDICF5_MAX_REFERENCE_SECONDS = 12.0
 INDICF5_MIN_REFERENCE_SECONDS = 3.0
 
 DURATION_POLICY_VERSION = "fixed_timeline_budget_v1"
+SINGLE_BATCH_POLICY_VERSION = "single_batch_v1"
 TEXT_NORMALIZATION_POLICY_VERSION = "hindi_codeswitch_v1"
 
 # This deliberately starts with only the technical words that failed the

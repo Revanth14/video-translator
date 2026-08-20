@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import subprocess
+import threading
 import time
 import wave
+from collections import deque
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from enum import Enum
@@ -14,6 +17,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from dub_mvp import indicf5_runtime
 from dub_mvp.artifacts import (
     ArtifactMetadata,
     completed_artifact_metadata,
@@ -35,6 +39,8 @@ from dub_mvp.duration import (
     load_duration_fit_artifact,
 )
 from dub_mvp.indicf5 import (
+    DURATION_POLICY_VERSION,
+    SINGLE_BATCH_POLICY_VERSION,
     IndicF5ChunkingError,
     IndicF5DurationError,
     IndicF5ReferenceError,
@@ -47,6 +53,10 @@ from dub_mvp.indicf5 import (
 from dub_mvp.localize import LocalizedSegment
 
 LOGGER = logging.getLogger(__name__)
+
+DEFAULT_INDICF5_MODEL_REVISION = "ai4bharat_indicf5_v1"
+REFERENCE_SELECTION_POLICY_VERSION = "configured_voice_catalog_v1"
+REFERENCE_EXTRACTION_POLICY_VERSION = "preexisting_reference_audio_v1"
 
 
 class SynthesisError(RuntimeError):
@@ -386,11 +396,18 @@ class IndicF5Provider:
         self,
         *,
         model_name: str = "ai4bharat/IndicF5",
+        model_revision: str | None = None,
         runtime_python: str | None = None,
         runtime_script: Path | None = None,
         timeout_seconds: float = 600.0,
+        shutdown_timeout_seconds: float = 5.0,
     ) -> None:
         self.model_name = model_name
+        self.model_revision = (
+            model_revision
+            or os.environ.get("VIDEO_TRANSLATOR_INDICF5_MODEL_REVISION")
+            or DEFAULT_INDICF5_MODEL_REVISION
+        ).strip()
         self.runtime_python = runtime_python or os.environ.get(
             "VIDEO_TRANSLATOR_INDICF5_PYTHON"
         )
@@ -398,6 +415,260 @@ class IndicF5Provider:
             "indicf5_runtime.py"
         )
         self.timeout_seconds = timeout_seconds
+        self.shutdown_timeout_seconds = shutdown_timeout_seconds
+        self._process: subprocess.Popen[str] | None = None
+        self._responses: queue.Queue[str | None] | None = None
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=100)
+        self._request_sequence = 0
+        self._lifecycle_lock = threading.RLock()
+        if not self.model_revision:
+            raise ValueError("IndicF5 model revision cannot be empty.")
+        if self.timeout_seconds <= 0 or self.shutdown_timeout_seconds <= 0:
+            raise ValueError("IndicF5 runtime timeouts must be positive.")
+
+    @property
+    def fingerprint_configuration(self) -> dict[str, str]:
+        return _indicf5_policy_configuration(model_revision=self.model_revision)
+
+    def __enter__(self) -> "IndicF5Provider":
+        self.start_stage()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close_stage()
+
+    def start_stage(self) -> None:
+        """Start one isolated runtime for this synthesis-stage execution."""
+
+        with self._lifecycle_lock:
+            if self._process is not None:
+                if self._process.poll() is None:
+                    return
+                detail = self._runtime_failure_detail(
+                    "IndicF5 runtime exited between utterances"
+                )
+                self._clear_runtime_locked()
+                raise SpeechProviderError(detail)
+            if not self.runtime_python:
+                raise SynthesisError(
+                    "Set VIDEO_TRANSLATOR_INDICF5_PYTHON to the isolated "
+                    "IndicF5 Python executable."
+                )
+
+            environment = os.environ.copy()
+            for credential_name in (
+                "HF_TOKEN",
+                "HUGGING_FACE_HUB_TOKEN",
+                "OPENAI_API_KEY",
+            ):
+                environment.pop(credential_name, None)
+            environment["HF_HUB_OFFLINE"] = "1"
+            environment["TRANSFORMERS_OFFLINE"] = "1"
+            self._stderr_tail.clear()
+            responses: queue.Queue[str | None] = queue.Queue()
+            try:
+                process = subprocess.Popen(
+                    [
+                        self.runtime_python,
+                        str(self.runtime_script),
+                        "--serve",
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    env=environment,
+                )
+            except FileNotFoundError as error:
+                raise SynthesisError(
+                    "IndicF5 runtime executable is missing: "
+                    f"{self.runtime_python}"
+                ) from error
+            assert process.stdin is not None
+            assert process.stdout is not None
+            assert process.stderr is not None
+            self._process = process
+            self._responses = responses
+            self._stdout_thread = threading.Thread(
+                target=self._read_protocol_lines,
+                args=(process.stdout, responses),
+                name="indicf5-stdout",
+                daemon=True,
+            )
+            self._stderr_thread = threading.Thread(
+                target=self._drain_diagnostics,
+                args=(process.stderr,),
+                name="indicf5-stderr",
+                daemon=True,
+            )
+            self._stdout_thread.start()
+            self._stderr_thread.start()
+            try:
+                ready = self._next_protocol_message(
+                    timeout_seconds=self.timeout_seconds,
+                    context="startup",
+                )
+            except BaseException:
+                self._abort_runtime_locked()
+                raise
+            if ready.get("type") != "ready" or ready.get("status") != "ready":
+                retryable = bool(ready.get("retryable"))
+                detail = str(ready.get("error") or "runtime startup failed")
+                self._abort_runtime_locked()
+                error_type = SpeechProviderError if retryable else SynthesisError
+                raise error_type(f"IndicF5 runtime startup failed: {detail}")
+            if (
+                ready.get("protocol_version")
+                != indicf5_runtime.RUNTIME_PROTOCOL_VERSION
+                or ready.get("runtime_revision")
+                != indicf5_runtime.RUNTIME_IMPLEMENTATION_REVISION
+                or ready.get("request_schema_version")
+                != indicf5_runtime.REQUEST_SCHEMA_VERSION
+            ):
+                self._abort_runtime_locked()
+                raise SynthesisError(
+                    "IndicF5 runtime protocol or revision does not match the "
+                    "synthesis provider."
+                )
+
+    def close_stage(self) -> None:
+        """Close stdin, then terminate and kill only if bounded waits expire."""
+
+        with self._lifecycle_lock:
+            process = self._process
+            if process is None:
+                return
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+                process.wait(timeout=self.shutdown_timeout_seconds)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.terminate()
+                    process.wait(timeout=self.shutdown_timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                        process.wait(timeout=self.shutdown_timeout_seconds)
+                    except Exception:
+                        LOGGER.warning(
+                            "Unable to kill timed-out IndicF5 runtime.",
+                            exc_info=True,
+                        )
+                except Exception:
+                    LOGGER.warning(
+                        "Unable to terminate IndicF5 runtime.",
+                        exc_info=True,
+                    )
+            except Exception:
+                # Cleanup runs in finally around the entire stage. It must not
+                # replace the provider or persistence error being reported.
+                LOGGER.warning(
+                    "Unable to close IndicF5 runtime cleanly.",
+                    exc_info=True,
+                )
+            finally:
+                self._clear_runtime_locked()
+
+    @staticmethod
+    def _read_protocol_lines(
+        stream: Any,
+        responses: queue.Queue[str | None],
+    ) -> None:
+        try:
+            for line in stream:
+                responses.put(line)
+        finally:
+            responses.put(None)
+
+    def _drain_diagnostics(self, stream: Any) -> None:
+        for line in stream:
+            detail = line.rstrip()
+            if detail:
+                if len(detail) > 2000:
+                    detail = f"...{detail[-1997:]}"
+                self._stderr_tail.append(detail)
+                LOGGER.debug("IndicF5 runtime: %s", detail)
+
+    def _next_protocol_message(
+        self,
+        *,
+        timeout_seconds: float,
+        context: str,
+    ) -> dict[str, Any]:
+        responses = self._responses
+        if responses is None:
+            raise SpeechProviderError("IndicF5 runtime response channel is closed.")
+        try:
+            line = responses.get(timeout=timeout_seconds)
+        except queue.Empty as error:
+            raise SpeechProviderError(
+                f"IndicF5 runtime {context} exceeded {timeout_seconds:g} seconds."
+            ) from error
+        if line is None:
+            raise SpeechProviderError(
+                self._runtime_failure_detail(
+                    f"IndicF5 runtime died during {context}"
+                )
+            )
+        try:
+            message = json.loads(line)
+        except (ValueError, TypeError) as error:
+            raise SpeechProviderError(
+                "IndicF5 runtime wrote non-protocol data to stdout."
+            ) from error
+        if not isinstance(message, dict):
+            raise SpeechProviderError(
+                "IndicF5 runtime response is not a JSON object."
+            )
+        return message
+
+    def _runtime_failure_detail(self, prefix: str) -> str:
+        process = self._process
+        return_code = process.poll() if process is not None else None
+        diagnostics = "\n".join(self._stderr_tail)[-2000:]
+        detail = f"{prefix} (exit code {return_code})"
+        if diagnostics:
+            detail = f"{detail}: {diagnostics}"
+        return detail
+
+    def _abort_runtime_locked(self) -> None:
+        process = self._process
+        try:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=self.shutdown_timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=self.shutdown_timeout_seconds)
+        except Exception:
+            LOGGER.warning("Unable to abort IndicF5 runtime.", exc_info=True)
+        finally:
+            self._clear_runtime_locked()
+
+    def _clear_runtime_locked(self) -> None:
+        process = self._process
+        if process is not None:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+        for thread in (self._stdout_thread, self._stderr_thread):
+            if thread is not None and thread is not threading.current_thread():
+                try:
+                    thread.join(timeout=1.0)
+                except RuntimeError:
+                    pass
+        self._process = None
+        self._responses = None
+        self._stdout_thread = None
+        self._stderr_thread = None
 
     def synthesize(
         self,
@@ -414,12 +685,6 @@ class IndicF5Provider:
             raise SynthesisError(
                 "IndicF5 requires an exact transcript for the reference audio."
             )
-        if not self.runtime_python:
-            raise SynthesisError(
-                "Set VIDEO_TRANSLATOR_INDICF5_PYTHON to the isolated IndicF5 "
-                "Python executable."
-            )
-
         reference_audio = Path(voice_reference.path)
         reference_seconds = _wav_duration_ms(reference_audio) / 1000
         try:
@@ -455,11 +720,15 @@ class IndicF5Provider:
             )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        request_path = output_path.with_name(f".{output_path.name}.indicf5-request.json")
-        response_path = output_path.with_name(f".{output_path.name}.indicf5-response.json")
+        self._request_sequence += 1
+        request_id = (
+            f"{segment.segment_id}-r{revision}-q{self._request_sequence}"
+        )
         request = {
-            "schema_version": 4,
+            "schema_version": indicf5_runtime.REQUEST_SCHEMA_VERSION,
+            "request_id": request_id,
             "model": self.model_name,
+            "model_revision": self.model_revision,
             "target_language": target_language,
             "translated_text": segment.target_text,
             "tts_text": text_plan.tts_text,
@@ -473,61 +742,45 @@ class IndicF5Provider:
             "fix_duration_seconds": round(fix_duration_seconds, 3),
             "revision": revision,
         }
-        _write_json(request_path, request)
-        environment = os.environ.copy()
-        for credential_name in (
-            "HF_TOKEN",
-            "HUGGING_FACE_HUB_TOKEN",
-            "OPENAI_API_KEY",
-        ):
-            environment.pop(credential_name, None)
-        environment["HF_HUB_OFFLINE"] = "1"
-        environment["TRANSFORMERS_OFFLINE"] = "1"
-        try:
-            completed = subprocess.run(
-                [
-                    self.runtime_python,
-                    str(self.runtime_script),
-                    str(request_path),
-                    str(response_path),
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                env=environment,
-            )
-        except FileNotFoundError as error:
-            raise SynthesisError(
-                f"IndicF5 runtime executable is missing: {self.runtime_python}"
-            ) from error
-        except subprocess.TimeoutExpired as error:
-            raise SpeechProviderError(
-                f"IndicF5 synthesis exceeded {self.timeout_seconds:g} seconds."
-            ) from error
-        finally:
+        with self._lifecycle_lock:
+            self.start_stage()
+            process = self._process
+            assert process is not None
+            assert process.stdin is not None
             try:
-                request_path.unlink(missing_ok=True)
-            except OSError:
-                LOGGER.warning("Unable to remove IndicF5 request %s", request_path)
-
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip()[-2000:]
-            error_type = SynthesisError if completed.returncode == 2 else SpeechProviderError
-            raise error_type(
-                f"IndicF5 runtime failed with exit code {completed.returncode}: {detail}"
-            )
-        try:
-            response = json.loads(response_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError) as error:
-            raise SpeechProviderError(
-                "IndicF5 runtime did not produce a valid response."
-            ) from error
-        finally:
+                process.stdin.write(
+                    json.dumps(request, ensure_ascii=True, separators=(",", ":"))
+                    + "\n"
+                )
+                process.stdin.flush()
+            except (BrokenPipeError, OSError) as error:
+                detail = self._runtime_failure_detail(
+                    f"IndicF5 runtime died before request {request_id} was sent"
+                )
+                self._abort_runtime_locked()
+                raise SpeechProviderError(detail) from error
             try:
-                response_path.unlink(missing_ok=True)
-            except OSError:
-                LOGGER.warning("Unable to remove IndicF5 response %s", response_path)
+                response = self._next_protocol_message(
+                    timeout_seconds=self.timeout_seconds,
+                    context=f"request {request_id}",
+                )
+            except BaseException:
+                self._abort_runtime_locked()
+                raise
+            if (
+                response.get("type") != "response"
+                or response.get("request_id") != request_id
+            ):
+                self._abort_runtime_locked()
+                raise SpeechProviderError(
+                    "IndicF5 runtime returned an uncorrelated response."
+                )
+            if response.get("status") != "completed":
+                retryable = bool(response.get("retryable"))
+                detail = str(response.get("error") or "runtime request failed")
+                self._abort_runtime_locked()
+                error_type = SpeechProviderError if retryable else SynthesisError
+                raise error_type(f"IndicF5 runtime request failed: {detail}")
 
         duration_ms = _positive_int(response.get("duration_ms"))
         if duration_ms is None:
@@ -537,8 +790,17 @@ class IndicF5Provider:
             duration_ms=duration_ms,
             seed=response.get("seed"),
             notes=[
-                "indicf5_chunk_policy=single_batch_v1",
+                f"indicf5_chunk_policy={SINGLE_BATCH_POLICY_VERSION}",
                 f"indicf5_batch_count={len(batches)}",
+                (
+                    "indicf5_runtime_protocol="
+                    f"{indicf5_runtime.RUNTIME_PROTOCOL_VERSION}"
+                ),
+                (
+                    "indicf5_runtime_revision="
+                    f"{indicf5_runtime.RUNTIME_IMPLEMENTATION_REVISION}"
+                ),
+                f"indicf5_model_revision={self.model_revision}",
                 *text_plan.notes(),
                 *duration_plan.notes(),
             ],
@@ -559,6 +821,36 @@ class SynthesisPipeline:
         self.duration_corrector = duration_corrector or DurationCorrector()
 
     def run(
+        self,
+        *,
+        localized_segments_path: Path,
+        run_directory: Path,
+        target_language: str,
+        voice_reference_path: Path,
+        reuse_completed_utterances: bool = True,
+    ) -> tuple[list[SynthesizedSegment], dict[str, str], str]:
+        close_stage = getattr(self._provider, "close_stage", None)
+        try:
+            return self._run_stage(
+                localized_segments_path=localized_segments_path,
+                run_directory=run_directory,
+                target_language=target_language,
+                voice_reference_path=voice_reference_path,
+                reuse_completed_utterances=reuse_completed_utterances,
+            )
+        finally:
+            if callable(close_stage):
+                try:
+                    close_stage()
+                except Exception:
+                    # A provider cleanup defect cannot hide the stage failure
+                    # that caused this finally block to run.
+                    LOGGER.warning(
+                        "Speech provider stage cleanup failed.",
+                        exc_info=True,
+                    )
+
+    def _run_stage(
         self,
         *,
         localized_segments_path: Path,
@@ -617,13 +909,20 @@ class SynthesisPipeline:
             for speaker in collision.speaker_ids
         }
         voices = {voice.reference_id: voice for voice in voice_catalog.voices}
+        # Validate inputs, voice assignment, and collision policy before paying
+        # the model-load cost. The child still spans every provider call in the
+        # stage and is closed by run() even when an utterance fails.
+        start_stage = getattr(self._provider, "start_stage", None)
+        if callable(start_stage):
+            start_stage()
+        provider_configuration = _speech_provider_configuration(self._provider)
         configuration = {
             "localized_segments_sha256": sha256_file(localized_segments_path),
             "target_language": target_language,
             "provider": self._provider.provider_name,
             "model": self._provider.model_name,
             "voice_map_sha256": sha256_file(voice_map_path),
-            **_provider_synthesis_configuration(self._provider.provider_name),
+            "provider_policy": provider_configuration,
             "duration_correction": (
                 self.duration_corrector.configuration_fingerprint
             ),
@@ -646,6 +945,7 @@ class SynthesisPipeline:
                 target_language=target_language,
                 provider_name=self._provider.provider_name,
                 model_name=self._provider.model_name,
+                provider_configuration=provider_configuration,
             )
             utterance_fingerprint = fingerprint_inputs(inputs)
             directory = utterances_directory / _utterance_directory_name(
@@ -1095,6 +1395,7 @@ def synthesis_outputs_reusable(
     target_language: str,
     provider_name: str,
     model_name: str,
+    provider_configuration: dict[str, str] | None = None,
 ) -> bool:
     required = {
         "synthesis_raw",
@@ -1109,6 +1410,11 @@ def synthesis_outputs_reusable(
     if not required.issubset(outputs):
         return False
     try:
+        resolved_provider_configuration = (
+            dict(provider_configuration)
+            if provider_configuration is not None
+            else _default_provider_synthesis_configuration(provider_name)
+        )
         segments = load_localized_segments(localized_segments_path)
         catalog = load_voice_catalog(voice_reference_path)
         voice_map, voice_map_path, voice_map_metadata_path = _find_voice_map(
@@ -1148,6 +1454,7 @@ def synthesis_outputs_reusable(
                 target_language=target_language,
                 provider_name=provider_name,
                 model_name=model_name,
+                provider_configuration=resolved_provider_configuration,
             )
             stem = f"tts-{fingerprint_inputs(inputs)[:16]}"
             artifact, artifact_path, _, _ = _find_reusable_speech_artifact(
@@ -1176,7 +1483,7 @@ def synthesis_outputs_reusable(
             "provider": provider_name,
             "model": model_name,
             "voice_map_sha256": sha256_file(voice_map_path),
-            **_provider_synthesis_configuration(provider_name),
+            "provider_policy": resolved_provider_configuration,
         }
         aggregate_metadata_path = Path(outputs["synthesized_segments_metadata"])
         aggregate_metadata = ArtifactMetadata.model_validate_json(
@@ -1815,6 +2122,7 @@ def _utterance_inputs(
     target_language: str,
     provider_name: str,
     model_name: str,
+    provider_configuration: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     inputs = {
         "utterance": segment.model_dump(mode="json"),
@@ -1823,6 +2131,11 @@ def _utterance_inputs(
         "target_language": target_language,
         "provider": provider_name,
         "model": model_name,
+        "provider_policy": (
+            dict(provider_configuration)
+            if provider_configuration is not None
+            else _default_provider_synthesis_configuration(provider_name)
+        ),
     }
     if provider_name == "indicf5":
         text_plan = indicf5_text_plan(
@@ -1836,14 +2149,46 @@ def _utterance_inputs(
     return inputs
 
 
-def _provider_synthesis_configuration(provider_name: str) -> dict[str, str]:
+def _indicf5_policy_configuration(*, model_revision: str) -> dict[str, str]:
+    return {
+        "runtime_protocol": indicf5_runtime.RUNTIME_PROTOCOL_VERSION,
+        "runtime_revision": indicf5_runtime.RUNTIME_IMPLEMENTATION_REVISION,
+        "model_revision": model_revision,
+        "duration_policy": DURATION_POLICY_VERSION,
+        "chunk_policy": SINGLE_BATCH_POLICY_VERSION,
+        "text_normalization_policy": (
+            indicf5_text_normalization_policy_version()
+        ),
+        "reference_selection_policy": REFERENCE_SELECTION_POLICY_VERSION,
+        "reference_extraction_policy": REFERENCE_EXTRACTION_POLICY_VERSION,
+    }
+
+
+def _default_provider_synthesis_configuration(
+    provider_name: str,
+) -> dict[str, str]:
     if provider_name == "indicf5":
-        return {
-            "text_normalization_policy": (
-                indicf5_text_normalization_policy_version()
-            ),
-        }
+        model_revision = (
+            os.environ.get("VIDEO_TRANSLATOR_INDICF5_MODEL_REVISION")
+            or DEFAULT_INDICF5_MODEL_REVISION
+        ).strip()
+        return _indicf5_policy_configuration(model_revision=model_revision)
     return {}
+
+
+def _speech_provider_configuration(provider: SpeechProvider) -> dict[str, str]:
+    configuration = getattr(provider, "fingerprint_configuration", None)
+    if configuration is None:
+        return _default_provider_synthesis_configuration(provider.provider_name)
+    if not isinstance(configuration, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in configuration.items()
+    ):
+        raise SynthesisError(
+            "Speech provider fingerprint configuration must contain string "
+            "keys and values."
+        )
+    return dict(configuration)
 
 
 def _voice_descriptor(voice: VoiceReference) -> dict[str, Any]:
