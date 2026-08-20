@@ -376,6 +376,15 @@ pronunciation policy. Evaluation can rerun one case with
 `scripts/evaluate-indicf5-crosslingual.py --case technical` without replacing
 the complete scoring sheet.
 
+The Phase 1 source-clone gate passed on 2026-08-20. Four native-Devanagari
+samples passed the fixed rubric on revision `d1e36b7`; the technical sample was
+then regenerated with `hindi_codeswitch_v1` on revision `f121859` and passed the
+same human thresholds. All five met the hard duration gate, and the reviewer
+confirmed intelligibility of at least 4/5, acceptable voice similarity, no
+severe filler or hallucination, and no clipped words. The consented audio and
+checksum-verified review record remain under ignored `evaluation/`; they are
+not source-controlled artifacts.
+
 Before the first provider call, `SynthesisPipeline` deterministically assigns
 speakers to the ordered catalog voices and persists a verified
 `SpeakerVoiceMap`. Repeated utterances from one speaker therefore always use
