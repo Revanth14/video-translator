@@ -41,19 +41,19 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 EVALUATION = REPOSITORY_ROOT / "evaluation"
 SOURCE_REFERENCE = EVALUATION / "voices" / "audio" / "hitesh-reference-001.wav"
 OUTPUT_DIRECTORY = EVALUATION / "voices" / "samples" / "phase1"
-TRIMMED_REFERENCE = OUTPUT_DIRECTORY / "reference-english-9s.wav"
+TRIMMED_REFERENCE = OUTPUT_DIRECTORY / "reference-english-7350ms.wav"
 
 # The source clip is 15 s, over the 12 s ceiling F5-TTS enforces by clipping
 # during preprocessing. Trim to a window the model will actually hear whole.
 REFERENCE_START_SECONDS = 0.0
-REFERENCE_SECONDS = 9.0
+REFERENCE_SECONDS = 7.35
 
 # MUST be the verbatim transcript of the TRIMMED window, not the whole clip.
 # A transcript describing audio the model was not given degrades the prompt.
-# Verify this by listening to reference-english-9s.wav before trusting results.
+# Verify reference-english-7350ms.wav by listening before trusting results.
 REFERENCE_TEXT = (
     "My email is one at the rate gmail.com. And let's just say I will set up "
-    "a password. Any password will work."
+    "a password."
 )
 
 # Representative set: short, medium, long, punctuation-heavy, and embedded
