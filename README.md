@@ -75,6 +75,34 @@ Every plan, subtitle, command history, WAV, MP4, and render report is
 revisioned and checksum verified. Interrupted rendering reuses verified
 intermediates.
 
+## Voice References
+
+IndicF5 is duration conditioned. Left to itself it predicts generated length
+from the ratio of reference to target text measured in UTF-8 bytes. That
+estimate breaks across scripts — Devanagari costs about 2.6 bytes per character
+against Latin's one — so an English reference prompting Hindi over-predicted
+duration by roughly that factor and the model padded the surplus with filler.
+
+Synthesis therefore **pins generation to each utterance's timeline budget**
+(`fix_duration`) instead of using that estimate. The utterance lands on its slot
+by construction and the byte heuristic never runs.
+
+Two constraints are enforced before GPU time is spent, because both are real
+model limits:
+
+- reference audio between 3 and 12 seconds, since F5-TTS clips anything longer
+  during preprocessing and the model would not hear the clip that was measured
+- reference plus target within the 25 s conditioning window
+
+Everything else is **recorded, not enforced**. A reference transcript in a
+different script than the target is expected in source-clone dubbing, where the
+speaker's own English audio prompts Hindi output, so it is reported as a note
+and a preflight warning. Speaking rates for both texts are recorded too, but no
+threshold is applied to their ratio: a Latin letter and a Devanagari akshara are
+not the same unit of speech, so comparing them would be an unmeasured heuristic.
+Measured output duration and the duration-correction stage decide acceptance,
+and cross-lingual voice quality is decided by listening.
+
 ## Benchmark
 
 Before spending provider or GPU capacity on the qualifying long-form run, use
@@ -84,8 +112,14 @@ the strict benchmark readiness profile:
 uv run dub-mvp preflight \
   --profile benchmark \
   --input-video evaluation/authorized-35-minute-source.mp4 \
-  --voice-reference evaluation/voice-catalog.json
+  --voice-reference evaluation/voice-catalog.json \
+  --target-language hi
 ```
+
+The `voice_reference:prompt` check flags unusable reference durations, blocking
+the benchmark profile while remaining a warning during local development. A
+script mismatch is always advisory because English-reference → Hindi prompting
+is the source-clone product and its quality must be verified by listening.
 
 Unlike the default local preflight, this exits nonzero unless the 30–45 minute
 input contract, FFmpeg, NVIDIA/CUDA runtime, WhisperX/OpenAI/IndicF5/Torch

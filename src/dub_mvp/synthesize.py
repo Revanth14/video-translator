@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import importlib
 import json
 import logging
 import os
+import subprocess
 import time
 import wave
 from collections.abc import Sequence
@@ -35,6 +35,14 @@ from dub_mvp.duration import (
     load_duration_fit_artifact,
 )
 from dub_mvp.localize import LocalizedSegment
+from dub_mvp.indicf5 import (
+    IndicF5ChunkingError,
+    IndicF5DurationError,
+    IndicF5ReferenceError,
+    indicf5_duration_plan,
+    single_text_batch,
+    validate_reference_seconds,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -58,6 +66,7 @@ class SpeechValidationError(SynthesisError):
 class VoiceReference(BaseModel):
     reference_id: str
     path: str | None = None
+    reference_text: str | None = None
     consent: str
     notes: str | None = None
 
@@ -69,11 +78,21 @@ class VoiceReference(BaseModel):
             raise ValueError("Voice reference fields cannot be empty.")
         return cleaned
 
+    @field_validator("reference_text")
+    @classmethod
+    def optional_text_must_not_be_empty(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = " ".join(value.split())
+        if not cleaned:
+            raise ValueError("Voice reference transcript cannot be empty.")
+        return cleaned
+
 
 class VoiceCatalog(BaseModel):
     """Ordered stock/reference voices available to a synthesis run."""
 
-    schema_version: int = Field(default=1, ge=1)
+    schema_version: int = Field(default=2, ge=1)
     voices: list[VoiceReference]
 
     @model_validator(mode="after")
@@ -361,9 +380,22 @@ class ControlledSpeechProvider(Protocol):
 class IndicF5Provider:
     provider_name = "indicf5"
 
-    def __init__(self, *, model_name: str = "ai4bharat/IndicF5") -> None:
+    def __init__(
+        self,
+        *,
+        model_name: str = "ai4bharat/IndicF5",
+        runtime_python: str | None = None,
+        runtime_script: Path | None = None,
+        timeout_seconds: float = 600.0,
+    ) -> None:
         self.model_name = model_name
-        self._module: Any | None = None
+        self.runtime_python = runtime_python or os.environ.get(
+            "VIDEO_TRANSLATOR_INDICF5_PYTHON"
+        )
+        self.runtime_script = runtime_script or Path(__file__).with_name(
+            "indicf5_runtime.py"
+        )
+        self.timeout_seconds = timeout_seconds
 
     def synthesize(
         self,
@@ -374,40 +406,134 @@ class IndicF5Provider:
         target_language: str,
         revision: int,
     ) -> SynthesisResult:
-        module = self._load_module()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            result = module.synthesize(
-                text=segment.target_text,
-                output_path=str(output_path),
-                language=target_language,
-                reference_audio=voice_reference.path,
-                model_name=self.model_name,
-                revision=revision,
+        if voice_reference.path is None:
+            raise SynthesisError("IndicF5 requires reference audio.")
+        if voice_reference.reference_text is None:
+            raise SynthesisError(
+                "IndicF5 requires an exact transcript for the reference audio."
             )
-        except Exception as error:  # provider SDKs expose heterogeneous errors
-            raise SpeechProviderError(
-                f"IndicF5 synthesis failed: {type(error).__name__}: {error}"
+        if not self.runtime_python:
+            raise SynthesisError(
+                "Set VIDEO_TRANSLATOR_INDICF5_PYTHON to the isolated IndicF5 "
+                "Python executable."
+            )
+
+        reference_audio = Path(voice_reference.path)
+        reference_seconds = _wav_duration_ms(reference_audio) / 1000
+        try:
+            validate_reference_seconds(reference_seconds)
+        except IndicF5ReferenceError as error:
+            raise SynthesisError(f"Unusable IndicF5 reference: {error}") from error
+        try:
+            batches = single_text_batch(segment.target_text)
+        except IndicF5ChunkingError as error:
+            raise SynthesisError(f"Unsafe IndicF5 text chunking: {error}") from error
+        try:
+            duration_plan = indicf5_duration_plan(
+                reference_text=voice_reference.reference_text,
+                reference_seconds=reference_seconds,
+                target_text=segment.target_text,
+                target_duration_ms=segment.duration_budget_ms,
+            )
+        except (IndicF5DurationError, IndicF5ReferenceError) as error:
+            raise SynthesisError(f"Unusable IndicF5 duration: {error}") from error
+        fix_duration_seconds = duration_plan.fix_duration_seconds
+        if not duration_plan.scripts_match:
+            # Expected in source-clone dubbing: an English reference prompting
+            # Hindi. Recorded so it is visible in review, not blocked.
+            LOGGER.info(
+                "Utterance %s prompts %s output with a %s reference.",
+                segment.segment_id,
+                duration_plan.target_script or "unknown",
+                duration_plan.reference_script or "unknown",
+            )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        request_path = output_path.with_name(f".{output_path.name}.indicf5-request.json")
+        response_path = output_path.with_name(f".{output_path.name}.indicf5-response.json")
+        request = {
+            "schema_version": 3,
+            "model": self.model_name,
+            "target_language": target_language,
+            "target_text": segment.target_text,
+            "text_batches": batches,
+            "output_path": str(output_path.resolve()),
+            "reference_audio": str(reference_audio.resolve()),
+            "reference_text": voice_reference.reference_text,
+            "reference_seconds": round(reference_seconds, 3),
+            "target_duration_ms": segment.duration_budget_ms,
+            "fix_duration_seconds": round(fix_duration_seconds, 3),
+            "revision": revision,
+        }
+        _write_json(request_path, request)
+        environment = os.environ.copy()
+        for credential_name in (
+            "HF_TOKEN",
+            "HUGGING_FACE_HUB_TOKEN",
+            "OPENAI_API_KEY",
+        ):
+            environment.pop(credential_name, None)
+        environment["HF_HUB_OFFLINE"] = "1"
+        environment["TRANSFORMERS_OFFLINE"] = "1"
+        try:
+            completed = subprocess.run(
+                [
+                    self.runtime_python,
+                    str(self.runtime_script),
+                    str(request_path),
+                    str(response_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                env=environment,
+            )
+        except FileNotFoundError as error:
+            raise SynthesisError(
+                f"IndicF5 runtime executable is missing: {self.runtime_python}"
             ) from error
-        duration_ms = _positive_int(_result_field(result, "duration_ms"))
+        except subprocess.TimeoutExpired as error:
+            raise SpeechProviderError(
+                f"IndicF5 synthesis exceeded {self.timeout_seconds:g} seconds."
+            ) from error
+        finally:
+            try:
+                request_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("Unable to remove IndicF5 request %s", request_path)
+
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()[-2000:]
+            error_type = SynthesisError if completed.returncode == 2 else SpeechProviderError
+            raise error_type(
+                f"IndicF5 runtime failed with exit code {completed.returncode}: {detail}"
+            )
+        try:
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as error:
+            raise SpeechProviderError(
+                "IndicF5 runtime did not produce a valid response."
+            ) from error
+        finally:
+            try:
+                response_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("Unable to remove IndicF5 response %s", response_path)
+
+        duration_ms = _positive_int(response.get("duration_ms"))
         if duration_ms is None:
             duration_ms = _wav_duration_ms(output_path)
         return SynthesisResult(
             audio_path=str(output_path),
             duration_ms=duration_ms,
-            seed=_result_field(result, "seed"),
+            seed=response.get("seed"),
+            notes=[
+                "indicf5_chunk_policy=single_batch_v1",
+                f"indicf5_batch_count={len(batches)}",
+                *duration_plan.notes(),
+            ],
         )
-
-    def _load_module(self) -> Any:
-        if self._module is None:
-            try:
-                self._module = importlib.import_module("indicf5")
-            except ImportError as error:
-                raise SynthesisError(
-                    "IndicF5 is not installed. Install it in the runtime that "
-                    "will run 'dub-mvp synthesize'."
-                ) from error
-        return self._module
 
 
 class SynthesisPipeline:
@@ -1695,6 +1821,7 @@ def _voice_descriptor(voice: VoiceReference) -> dict[str, Any]:
         "reference_audio_sha256": (
             sha256_file(Path(voice.path)) if voice.path is not None else None
         ),
+        "reference_text": voice.reference_text,
     }
 
 

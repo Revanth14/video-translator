@@ -5,12 +5,21 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
+import wave
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
+from dub_mvp.indicf5 import (
+    IndicF5ReferenceError,
+    dominant_script,
+    speech_units,
+    validate_reference_script,
+    validate_reference_seconds,
+)
 from dub_mvp.manifest import RunManifest
 from dub_mvp.media import MediaIngestor, MediaToolError
 from dub_mvp.synthesize import SynthesisError, load_voice_catalog
@@ -44,6 +53,7 @@ def build_preflight_report(
     run_directory: Path | None = None,
     voice_reference_path: Path | None = None,
     input_video_path: Path | None = None,
+    target_language: str = "hi",
     media_ingestor: MediaIngestor | None = None,
 ) -> PreflightReport:
     benchmark = profile == PreflightProfile.BENCHMARK
@@ -52,7 +62,7 @@ def build_preflight_report(
         _tool_check("ffprobe"),
         _module_check("whisperx", required=benchmark),
         _module_check("openai", required=benchmark),
-        _module_check("indicf5", required=benchmark),
+        _indicf5_runtime_check(required=benchmark),
         _module_check("torch", required=benchmark),
         _env_check("OPENAI_API_KEY", required=benchmark),
     ]
@@ -74,6 +84,13 @@ def build_preflight_report(
         checks.extend(_run_checks(run_directory))
     if voice_reference_path is not None:
         checks.append(_voice_reference_check(voice_reference_path))
+        checks.append(
+            _voice_prompt_check(
+                voice_reference_path,
+                target_language=target_language,
+                required=benchmark,
+            )
+        )
     elif benchmark:
         checks.append(
             PreflightCheck(
@@ -138,6 +155,76 @@ def _env_check(name: str, *, required: bool) -> PreflightCheck:
         name=f"env:{name}",
         status="fail" if required else "warn",
         detail=f"{name} is not set.",
+    )
+
+
+def _indicf5_runtime_check(*, required: bool) -> PreflightCheck:
+    name = "runtime:indicf5"
+    executable = os.environ.get("VIDEO_TRANSLATOR_INDICF5_PYTHON")
+    if not executable:
+        return PreflightCheck(
+            name=name,
+            status="fail" if required else "warn",
+            detail=(
+                "VIDEO_TRANSLATOR_INDICF5_PYTHON is not set to the isolated "
+                "IndicF5 Python executable."
+            ),
+        )
+    resolved = shutil.which(executable)
+    if resolved is None and Path(executable).is_file():
+        resolved = str(Path(executable).resolve())
+    if resolved is None:
+        return PreflightCheck(
+            name=name,
+            status="fail" if required else "warn",
+            detail=f"IndicF5 Python executable was not found: {executable}",
+        )
+    environment = os.environ.copy()
+    for credential_name in (
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "OPENAI_API_KEY",
+    ):
+        environment.pop(credential_name, None)
+    environment["HF_HUB_OFFLINE"] = "1"
+    environment["TRANSFORMERS_OFFLINE"] = "1"
+    try:
+        completed = subprocess.run(
+            [
+                resolved,
+                "-c",
+                (
+                    "import f5_tts, torch; "
+                    "assert torch.cuda.is_available(); "
+                    "print(torch.cuda.get_device_name(0))"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return PreflightCheck(
+            name=name,
+            status="fail" if required else "warn",
+            detail=f"Unable to inspect isolated IndicF5 runtime: {error}",
+        )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()[-1000:]
+        return PreflightCheck(
+            name=name,
+            status="fail" if required else "warn",
+            detail=f"Isolated IndicF5 runtime is unavailable: {detail}",
+        )
+    return PreflightCheck(
+        name=name,
+        status="pass",
+        detail=(
+            f"Isolated IndicF5 runtime is ready at {resolved}: "
+            f"{completed.stdout.strip()}"
+        ),
     )
 
 
@@ -342,5 +429,109 @@ def _voice_reference_check(path: Path) -> PreflightCheck:
         detail=(
             f"Loaded {len(catalog.voices)} consented voice(s): "
             + ", ".join(voice.reference_id for voice in catalog.voices)
+        ),
+    )
+
+
+def _voice_prompt_check(
+    path: Path,
+    *,
+    target_language: str,
+    required: bool,
+) -> PreflightCheck:
+    """Validate hard reference limits and report advisory prompt properties.
+
+    Reference duration is a model constraint. Script pairing is advisory:
+    fixed-duration source cloning deliberately prompts across scripts, and its
+    acoustic quality is decided by listening. Consent and catalog structure are
+    checked separately.
+    """
+
+    name = "voice_reference:prompt"
+    failure_status = "fail" if required else "warn"
+    try:
+        catalog = load_voice_catalog(path)
+    except SynthesisError as error:
+        return PreflightCheck(name=name, status=failure_status, detail=str(error))
+
+    problems: list[str] = []
+    advisories: list[str] = []
+    summaries: list[str] = []
+    for voice in catalog.voices:
+        label = voice.reference_id
+        if voice.path is None or voice.reference_text is None:
+            problems.append(
+                f"{label}: IndicF5 needs both reference audio and its exact "
+                "transcript; this voice has "
+                + (
+                    "no audio path"
+                    if voice.path is None
+                    else "no reference_text"
+                )
+            )
+            continue
+        try:
+            with wave.open(str(Path(voice.path)), "rb") as handle:
+                frames = handle.getnframes()
+                frame_rate = handle.getframerate()
+                channels = handle.getnchannels()
+        except (OSError, wave.Error) as error:
+            problems.append(f"{label}: unreadable reference WAV ({error})")
+            continue
+        if frames <= 0 or frame_rate <= 0:
+            problems.append(f"{label}: reference WAV has no decodable audio")
+            continue
+        seconds = frames / frame_rate
+        try:
+            validate_reference_seconds(seconds)
+        except IndicF5ReferenceError as error:
+            problems.append(f"{label}: {error}")
+            continue
+        units = speech_units(voice.reference_text)
+        if units <= 0:
+            problems.append(f"{label}: transcript has no pronounceable units")
+            continue
+        # A cross-script pairing is advisory, never blocking: source-clone
+        # dubbing prompts Hindi with the speaker's own English audio, and
+        # generation is pinned with fix_duration rather than the byte ratio
+        # that made the mismatch harmful.
+        script = dominant_script(voice.reference_text)
+        try:
+            validate_reference_script(
+                voice.reference_text,
+                target_language=target_language,
+            )
+        except IndicF5ReferenceError as error:
+            advisories.append(f"{label}: {error}")
+        rate = units / seconds
+        summaries.append(
+            f"{label}: {seconds:.2f}s {script} at {rate:.1f} units/s, "
+            f"{channels}ch {frame_rate}Hz"
+        )
+
+    if problems:
+        return PreflightCheck(
+            name=name,
+            status=failure_status,
+            detail="; ".join(problems),
+        )
+    if advisories:
+        return PreflightCheck(
+            name=name,
+            status="warn",
+            detail=(
+                "Cross-script prompting (expected for source-clone dubbing; "
+                "verify quality by listening): "
+                + "; ".join(advisories)
+                + "; measurements: "
+                + "; ".join(summaries)
+            ),
+        )
+    return PreflightCheck(
+        name=name,
+        status="pass",
+        detail=(
+            f"{len(summaries)} reference(s) usable for {target_language}: "
+            + "; ".join(summaries)
         ),
     )

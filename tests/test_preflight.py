@@ -1,3 +1,5 @@
+import json
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +17,46 @@ from dub_mvp.preflight import (
 
 FIXTURES = Path(__file__).parent / "fixtures"
 VOICE_REFERENCE = FIXTURES / "voice_reference_smoke.json"
+HINDI_REFERENCE_TEXT = (
+    "मेरा नाम राहुल है और मैं इस वीडियो में आपको एक नई तकनीक के बारे में "
+    "बताने जा रहा हूँ। यह बहुत आसान है।"
+)
+
+
+def write_reference_wav(path: Path, seconds: float, frame_rate: int = 24_000) -> None:
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(frame_rate)
+        handle.writeframes(b"\x00\x00" * int(seconds * frame_rate))
+
+
+def write_voice_catalog(
+    directory: Path,
+    *,
+    reference_seconds: float = 9.0,
+    reference_text: str = HINDI_REFERENCE_TEXT,
+) -> Path:
+    audio_path = directory / "reference.wav"
+    write_reference_wav(audio_path, reference_seconds)
+    catalog_path = directory / "voice-catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "voices": [
+                    {
+                        "reference_id": "benchmark-reference",
+                        "path": str(audio_path),
+                        "reference_text": reference_text,
+                        "consent": "approved fixture",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return catalog_path
 
 
 def test_preflight_reports_missing_required_tools(monkeypatch) -> None:
@@ -68,6 +110,106 @@ def test_preflight_validates_voice_reference(monkeypatch) -> None:
     )
 
 
+def test_preflight_warns_but_never_blocks_on_cross_script_reference(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Source-clone dubbing prompts Hindi with English audio by design.
+
+    Advisory in both profiles: blocking it would forbid the very configuration
+    the product depends on, and quality there is decided by listening.
+    """
+    monkeypatch.setattr(
+        "dub_mvp.preflight.shutil.which",
+        lambda name: f"/fake/{name}",
+    )
+    monkeypatch.setattr(
+        "dub_mvp.preflight._indicf5_runtime_check",
+        lambda *, required: PreflightCheck(
+            name="runtime:indicf5",
+            status="pass",
+            detail="fixture isolated TTS runtime",
+        ),
+    )
+    catalog = write_voice_catalog(
+        tmp_path,
+        reference_text="My email is one at the rate gmail.com and it works.",
+    )
+
+    for profile in (PreflightProfile.LOCAL, PreflightProfile.BENCHMARK):
+        report = build_preflight_report(
+            profile=profile,
+            voice_reference_path=catalog,
+            target_language="hi",
+        )
+        check = next(
+            item for item in report.checks if item.name == "voice_reference:prompt"
+        )
+        assert check.status == "warn", profile
+        assert "devanagari" in check.detail
+
+
+def test_benchmark_preflight_blocks_over_long_reference_audio(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "dub_mvp.preflight.shutil.which",
+        lambda name: f"/fake/{name}",
+    )
+    catalog = write_voice_catalog(tmp_path, reference_seconds=15.0)
+
+    report = build_preflight_report(
+        voice_reference_path=catalog,
+        target_language="hi",
+    )
+    local_check = next(
+        item for item in report.checks if item.name == "voice_reference:prompt"
+    )
+    assert local_check.status == "warn"
+    assert "clips anything over 12s" in local_check.detail
+
+    monkeypatch.setattr(
+        "dub_mvp.preflight._indicf5_runtime_check",
+        lambda *, required: PreflightCheck(
+            name="runtime:indicf5",
+            status="pass",
+            detail="fixture isolated TTS runtime",
+        ),
+    )
+    benchmark_report = build_preflight_report(
+        profile=PreflightProfile.BENCHMARK,
+        voice_reference_path=catalog,
+        target_language="hi",
+    )
+
+    benchmark_check = next(
+        item
+        for item in benchmark_report.checks
+        if item.name == "voice_reference:prompt"
+    )
+    assert benchmark_report.ok is False
+    assert benchmark_check.status == "fail"
+
+
+def test_preflight_accepts_a_matched_reference(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "dub_mvp.preflight.shutil.which",
+        lambda name: f"/fake/{name}",
+    )
+
+    report = build_preflight_report(
+        voice_reference_path=write_voice_catalog(tmp_path),
+        target_language="hi",
+    )
+
+    check = next(
+        item for item in report.checks if item.name == "voice_reference:prompt"
+    )
+    assert check.status == "pass"
+    assert "devanagari" in check.detail
+
+
 def test_preflight_command_exits_nonzero_for_blocking_failure(
     monkeypatch,
 ) -> None:
@@ -103,7 +245,7 @@ def test_benchmark_preflight_turns_missing_runtime_into_blockers(
     statuses = {check.name: check.status for check in report.checks}
     assert statuses["python:whisperx"] == "fail"
     assert statuses["python:openai"] == "fail"
-    assert statuses["python:indicf5"] == "fail"
+    assert statuses["runtime:indicf5"] == "fail"
     assert statuses["python:torch"] == "fail"
     assert statuses["env:OPENAI_API_KEY"] == "fail"
     assert statuses["tool:nvidia-smi"] == "fail"
@@ -150,6 +292,14 @@ def test_benchmark_preflight_accepts_complete_measured_setup(
             detail="fixture GPU",
         ),
     )
+    monkeypatch.setattr(
+        "dub_mvp.preflight._indicf5_runtime_check",
+        lambda *, required: PreflightCheck(
+            name="runtime:indicf5",
+            status="pass",
+            detail="fixture isolated TTS runtime",
+        ),
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "test-only")
     monkeypatch.setenv(
         "VIDEO_TRANSLATOR_OPENAI_INPUT_USD_PER_MILLION",
@@ -163,7 +313,7 @@ def test_benchmark_preflight_accepts_complete_measured_setup(
     report = build_preflight_report(
         profile=PreflightProfile.BENCHMARK,
         input_video_path=input_video,
-        voice_reference_path=VOICE_REFERENCE,
+        voice_reference_path=write_voice_catalog(tmp_path),
         media_ingestor=FakeIngestor(),
     )
 

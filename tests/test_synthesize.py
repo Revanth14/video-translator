@@ -1,9 +1,9 @@
 import json
 import os
+import sys
 import wave
 from multiprocessing import Process
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,6 +23,7 @@ from dub_mvp.synthesize import (
     SynthesisPipeline,
     SynthesisResult,
     VoiceCatalog,
+    VoiceReference,
     load_localized_segments,
     load_voice_catalog,
     load_voice_reference,
@@ -79,17 +80,6 @@ class FixtureSpeechProvider:
         )
 
 
-class FakeIndicF5Module:
-    def __init__(self, *, result: Any) -> None:
-        self.result = result
-        self.calls: list[dict[str, Any]] = []
-
-    def synthesize(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        write_wav(Path(kwargs["output_path"]), 1000)
-        return self.result
-
-
 def write_wav(path: Path, duration_ms: int, *, frame_rate: int = 1000) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     frames = duration_ms * frame_rate // 1000
@@ -100,15 +90,43 @@ def write_wav(path: Path, duration_ms: int, *, frame_rate: int = 1000) -> None:
         handle.writeframes(b"\x00\x00" * frames)
 
 
-def test_indicf5_provider_extracts_seed_and_duration_from_dict_result(
+def test_indicf5_provider_runs_isolated_runtime_with_balanced_batches(
     tmp_path: Path,
 ) -> None:
-    provider = IndicF5Provider()
-    provider._module = FakeIndicF5Module(
-        result={"duration_ms": 3200, "seed": 42}
+    runtime = tmp_path / "fake_indicf5_runtime.py"
+    runtime.write_text(
+        """
+import json
+import sys
+import wave
+from pathlib import Path
+
+request = json.loads(Path(sys.argv[1]).read_text())
+Path(sys.argv[1]).with_name("captured-request.json").write_text(json.dumps(request))
+output = Path(request["output_path"])
+output.parent.mkdir(parents=True, exist_ok=True)
+with wave.open(str(output), "wb") as handle:
+    handle.setnchannels(1)
+    handle.setsampwidth(2)
+    handle.setframerate(24000)
+    handle.writeframes(b"\\x00\\x00" * 24000)
+Path(sys.argv[2]).write_text(json.dumps({"duration_ms": 3200, "seed": 42}))
+""",
+        encoding="utf-8",
+    )
+    reference_audio = tmp_path / "reference.wav"
+    write_wav(reference_audio, 9_000)
+    provider = IndicF5Provider(
+        runtime_python=sys.executable,
+        runtime_script=runtime,
     )
     segment = load_localized_segments(LOCALIZED)[0]
-    voice_reference = load_voice_reference(VOICE_REFERENCE)
+    voice_reference = VoiceReference(
+        reference_id="approved-reference",
+        path=str(reference_audio),
+        reference_text="This is an exact and sufficiently detailed reference transcript.",
+        consent="approved fixture",
+    )
 
     result = provider.synthesize(
         segment,
@@ -120,17 +138,97 @@ def test_indicf5_provider_extracts_seed_and_duration_from_dict_result(
 
     assert result.duration_ms == 3200
     assert result.seed == 42
+    assert "indicf5_chunk_policy=single_batch_v1" in result.notes
+    assert "indicf5_duration_policy=fixed_timeline_budget_v1" in result.notes
+    assert not list(tmp_path.glob("*.indicf5-*.json"))
+
+    request = json.loads((tmp_path / "captured-request.json").read_text())
+    # Generation is pinned to reference + timeline budget rather than left to
+    # the UTF-8 byte ratio that mistimed the evaluation samples.
+    assert request["target_duration_ms"] == segment.duration_budget_ms
+    assert request["reference_seconds"] == pytest.approx(9.0)
+    assert request["fix_duration_seconds"] == pytest.approx(12.28)
+    assert request["schema_version"] == 3
+    assert "max_chunk_bytes" not in request
 
 
-def test_indicf5_provider_extracts_seed_and_duration_from_object_result(
-    tmp_path: Path,
-) -> None:
-    provider = IndicF5Provider()
-    provider._module = FakeIndicF5Module(
-        result=SimpleNamespace(duration_ms=2800, seed=7)
+def test_indicf5_provider_rejects_over_long_reference_audio(tmp_path: Path) -> None:
+    reference_audio = tmp_path / "reference.wav"
+    write_wav(reference_audio, 15_000)
+    provider = IndicF5Provider(
+        runtime_python=sys.executable,
+        runtime_script=tmp_path / "unused.py",
     )
     segment = load_localized_segments(LOCALIZED)[0]
-    voice_reference = load_voice_reference(VOICE_REFERENCE)
+    voice_reference = VoiceReference(
+        reference_id="approved-reference",
+        path=str(reference_audio),
+        reference_text="This is an exact and sufficiently detailed reference transcript.",
+        consent="approved fixture",
+    )
+
+    with pytest.raises(SynthesisError, match="clips anything over"):
+        provider.synthesize(
+            segment,
+            output_path=tmp_path / "tts-r1.wav",
+            voice_reference=voice_reference,
+            target_language="hi",
+            revision=1,
+        )
+
+
+def test_indicf5_provider_records_cross_script_prompting(tmp_path: Path) -> None:
+    """Source-clone dubbing prompts Hindi with the speaker's English audio.
+
+    That pairing is the product, so it must proceed and be recorded rather than
+    rejected. Generation is pinned with fix_duration, so the byte ratio that
+    once made a cross-script reference harmful never runs.
+    """
+    runtime = tmp_path / "fake_indicf5_runtime.py"
+    runtime.write_text(
+        """
+import json
+import sys
+import wave
+from pathlib import Path
+
+request = json.loads(Path(sys.argv[1]).read_text())
+output = Path(request["output_path"])
+output.parent.mkdir(parents=True, exist_ok=True)
+with wave.open(str(output), "wb") as handle:
+    handle.setnchannels(1)
+    handle.setsampwidth(2)
+    handle.setframerate(24000)
+    handle.writeframes(b"\\x00\\x00" * 24000)
+Path(sys.argv[2]).write_text(json.dumps({"duration_ms": 3280}))
+""",
+        encoding="utf-8",
+    )
+    reference_audio = tmp_path / "reference.wav"
+    write_wav(reference_audio, 9_000)
+    provider = IndicF5Provider(
+        runtime_python=sys.executable,
+        runtime_script=runtime,
+    )
+    # This is the 306-byte representative long case. The retired
+    # reference-derived byte budget admitted only 190 bytes and stopped this
+    # request before the GPU despite its duration fitting the 25-second window.
+    segment = load_localized_segments(LOCALIZED)[0].model_copy(
+        update={
+            "end_ms": 11_120,
+            "duration_budget_ms": 11_000,
+            "target_text": (
+                "आज हम सीखेंगे कि किसी भी वीडियो को एक भाषा से दूसरी भाषा में "
+                "कैसे बदला जाता है, और इसमें आवाज़ को कैसे बनाए रखा जाता है।"
+            ),
+        }
+    )
+    voice_reference = VoiceReference(
+        reference_id="approved-reference",
+        path=str(reference_audio),
+        reference_text="My email is one at the rate gmail.com and it works.",
+        consent="approved fixture",
+    )
 
     result = provider.synthesize(
         segment,
@@ -140,8 +238,39 @@ def test_indicf5_provider_extracts_seed_and_duration_from_object_result(
         revision=1,
     )
 
-    assert result.duration_ms == 2800
-    assert result.seed == 7
+    assert "indicf5_scripts_match=false" in result.notes
+    assert "indicf5_reference_script=latin" in result.notes
+    assert "indicf5_target_script=devanagari" in result.notes
+    # Incomparable unit counts, so no scale is claimed.
+    assert not any(
+        note.startswith("indicf5_implied_rate_scale=") for note in result.notes
+    )
+
+
+def test_indicf5_provider_requires_exact_reference_transcript(
+    tmp_path: Path,
+) -> None:
+    reference_audio = tmp_path / "reference.wav"
+    write_wav(reference_audio, 10_000)
+    provider = IndicF5Provider(
+        runtime_python=sys.executable,
+        runtime_script=tmp_path / "unused.py",
+    )
+    segment = load_localized_segments(LOCALIZED)[0]
+    voice_reference = VoiceReference(
+        reference_id="approved-reference",
+        path=str(reference_audio),
+        consent="approved fixture",
+    )
+
+    with pytest.raises(SynthesisError, match="exact transcript"):
+        provider.synthesize(
+            segment,
+            output_path=tmp_path / "tts-r1.wav",
+            voice_reference=voice_reference,
+            target_language="hi",
+            revision=1,
+        )
 
 
 def test_loads_localized_segments_and_voice_reference() -> None:

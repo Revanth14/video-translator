@@ -323,6 +323,39 @@ time. Each reference requires explicit consent metadata. Relative reference
 audio paths resolve from the catalog directory; missing or empty reference
 audio fails before synthesis.
 
+#### IndicF5 duration conditioning
+
+IndicF5 is duration conditioned. Without `fix_duration` it predicts generated
+length from the reference-to-target text ratio **in UTF-8 bytes**, which is only
+meaningful within one script: Devanagari costs about 2.6 bytes per character
+against Latin's one, so an English reference prompting Hindi over-predicted
+duration by roughly that factor and the model filled the surplus with filler.
+Two evaluation samples measured 11.44 s for a ~4.5 s line, identical to the
+millisecond across different chunkings — the length was a function of byte
+counts, not speech.
+
+`IndicF5Provider` therefore pins generation to each utterance's
+`duration_budget_ms` (`indicf5_duration_plan`, policy
+`fixed_timeline_budget_v1`). `fix_duration` is the whole conditioning window, so
+the runtime restates it against the reference actually loaded after
+`preprocess_ref_audio_text` and the generated portion equals the timeline slot.
+The byte heuristic never executes.
+
+Only two conditions are hard failures, because only two are model limits: a
+reference outside 3–12 s (F5-TTS clips longer clips during preprocessing, so the
+model would not hear the clip that was measured) and a reference-plus-target
+window beyond 25 s.
+
+Script pairing and speaking rate are **recorded, not enforced**. Source-clone
+dubbing prompts Hindi output with the speaker's own English audio, so a
+cross-script reference is the product rather than a defect; it is reported in
+the synthesis notes and as a preflight `warn`. Unit rates for both texts are
+recorded, but no threshold is applied to their ratio, because a Latin letter and
+a Devanagari akshara are not the same unit of speech and a threshold on them
+would be an unmeasured heuristic. Measured output duration and the
+duration-correction stage decide acceptance; cross-lingual voice quality is
+decided by listening (`scripts/evaluate-indicf5-crosslingual.py`).
+
 Before the first provider call, `SynthesisPipeline` deterministically assigns
 speakers to the ordered catalog voices and persists a verified
 `SpeakerVoiceMap`. Repeated utterances from one speaker therefore always use

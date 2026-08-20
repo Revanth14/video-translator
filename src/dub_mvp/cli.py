@@ -869,6 +869,14 @@ def preflight(
         resolve_path=True,
         help="Authorized 30-45 minute source required by benchmark profile.",
     ),
+    target_language: str = typer.Option(
+        "hi",
+        "--target-language",
+        help=(
+            "Dubbing target language. Reference transcripts must be written "
+            "in this language's script for IndicF5 to time speech correctly."
+        ),
+    ),
 ) -> None:
     """Check local or strict long-form benchmark readiness."""
     report = build_preflight_report(
@@ -876,6 +884,7 @@ def preflight(
         run_directory=run,
         voice_reference_path=voice_reference,
         input_video_path=input_video,
+        target_language=target_language,
     )
     typer.echo(report_to_json(report).rstrip())
     if not report.ok:
