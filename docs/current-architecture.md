@@ -413,6 +413,18 @@ IndicF5 child or NVIDIA compute process. Human review passed all five for at
 least 4/5 intelligibility, acceptable voice similarity, no severe filler or
 hallucination, and no clipped words.
 
+The sanitized reusable runtime image is
+`ami-063299ffd2920f641` in `us-east-2`, backed by encrypted snapshot
+`snap-08bffffca78622768`. Authorized reference/generated media and temporary
+WAVs were removed and a media-free inventory passed before image creation. The
+image intentionally records source revision `bd6e88a`; deployments must pull
+the desired application revision instead of treating the AMI's clone as
+current code. The same host later exercised the `0460241` bootstrap with
+`HOME` absent, including a fresh uv installer path, 144 locked package checks,
+model checksum verification, TorchCodec import, and Tesla T4 preflight. The
+source Spot instance was then terminated, with no pending or running Spot
+instances remaining in the Region.
+
 IndicF5 raw-speech and synthesis-configuration fingerprints include the model
 revision, runtime protocol and implementation revision,
 `fixed_timeline_budget_v1`, `single_batch_v1`, the text-normalization policy,
