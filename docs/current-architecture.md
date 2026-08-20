@@ -425,6 +425,29 @@ model checksum verification, TorchCodec import, and Tesla T4 preflight. The
 source Spot instance was then terminated, with no pending or running Spot
 instances remaining in the Region.
 
+The image also passed a fresh-boot validation on 2026-08-20. Launch-template
+`lt-0ee8ae975fceac530` version 2 started a new `g4dn.xlarge` Spot instance from
+the image in `us-east-2c`; SSM became reachable about 69 seconds after the EC2
+launch timestamp, and both EC2 system and instance checks reached `ok`. The
+host pulled application revision `c23e23c`, imported the exact locked Torch,
+TorchAudio, TorchCodec, and Transformers environment, created a CUDA tensor on
+the Tesla T4, verified every qualified model/vocoder checksum, passed local
+preflight, and loaded the full IndicF5 runtime with both Hugging Face and
+Transformers forced offline. The runtime emitted its `ready` record with
+protocol `stage_ndjson_v1` and revision `indicf5_runtime_v5`.
+
+On that cold snapshot, checksum verification and the block reads it induced
+took 259.14 seconds; the subsequent offline model load took 122.16 seconds and
+3,393,104 KB max RSS. The complete validation command ran from 15:06:26Z to
+15:15:48Z (562 seconds), including imports, CUDA initialization, verification,
+preflight, and model load. Process inspection during checksum verification
+showed the reader blocked in the kernel's folio wait path, so EBS snapshot
+lazy block restoration materially contributed to this first-read result. This
+is an AMI cold-start qualification measurement, not per-video synthesis
+latency. A media inventory and child-process check passed afterward. The
+validation instance was terminated, its one-time Spot request was cancelled,
+and the Region again had zero pending or running Spot instances.
+
 IndicF5 raw-speech and synthesis-configuration fingerprints include the model
 revision, runtime protocol and implementation revision,
 `fixed_timeline_budget_v1`, `single_batch_v1`, the text-normalization policy,
@@ -633,6 +656,12 @@ changed stage evidence, artifacts, configuration, or human review does.
   30–45 minute workload. Long-form thermal behavior, memory over many
   utterances, interruption/resume on Spot, and cost per source minute remain
   part of the full benchmark rather than being inferred from this short gate.
+- The sanitized AMI passes a real fresh boot, but a cold snapshot required
+  259.14 seconds for complete checksum verification/block prewarming and a
+  further 122.16 seconds for the offline model load. There is no production
+  worker-reuse/idle-drain policy, warm capacity, or measured Fast Snapshot
+  Restore decision yet. Launching one instance per video would expose this
+  delay and is not the intended production scheduling policy.
 - `cli.py` still holds a manifest across pipeline execution (the pattern fixed
   in `runner.py`). Safe only because nothing else writes during a CLI run; it
   will conflict if an operator runs a stage while a worker holds a lease.
